@@ -27,7 +27,7 @@ struct SuperblockV0 {
     free_space_info_address: u64,
     end_of_file_address: u64,
     driver_info_address: u64,
-    root_group_symbol_table_entry: u32,
+    root_group_symbol_table_entry: SymbolTableEntry,
 }
 
 #[derive(BinRead, Debug)]
@@ -236,6 +236,40 @@ struct DataObjectHeader {
     messages: Vec<HeaderMessage>,
 }
 
+impl DataObjectHeader {
+    pub fn symbol_table_message(&self) -> Option<&SymbolTableMessage> {
+        self.messages.iter().find_map(|x| match &x.inner {
+            InnerMessage::SymbolTable(s) => Some(s),
+            _ => None,
+        })
+    }
+}
+
+#[derive(BinRead, Debug)]
+#[br(import(object_header_size: u32))]
+struct MessageList {
+    #[br(parse_with = parse_header_list, args(object_header_size))]
+    messages: Vec<HeaderMessage>,
+}
+
+impl DataObjectHeader {
+    pub fn load_continuation_messages<R: Read + Seek>(&mut self, reader: &mut R) -> BinResult<()> {
+        let mut new_messages = vec![];
+        for m in self.messages.iter() {
+            let InnerMessage::ObjectHeaderContinuation(m) = &m.inner else {
+                continue;
+            };
+
+            reader.seek(SeekFrom::Start(m.offset))?;
+            let msg = MessageList::read_le_args(reader, (m.length as u32,))?;
+            new_messages.extend(msg.messages);
+        }
+
+        self.messages.extend(new_messages);
+        Ok(())
+    }
+}
+
 /// Need a custom parser for the Header Message list: we
 /// don't know how many messages will be in this block,
 /// we only know the total size of the header. So this method
@@ -284,6 +318,8 @@ enum InnerMessage {
     Attribute(AttributeMessage),
     #[br(pre_assert(ty == 16))]
     ObjectHeaderContinuation(ObjectHeaderContinuationMessage),
+    #[br(pre_assert(ty == 17))]
+    SymbolTable(SymbolTableMessage),
     #[br(pre_assert(ty == 18))]
     ModificationTie(ModificationTimMessage),
     #[br(pre_assert(ty != 12 && ty != 3 && ty != 8))]
@@ -336,7 +372,9 @@ enum TypeDescriptor {
     FloatingPoint(FloatingPointDescriptor),
     #[br(pre_assert(class == 3))]
     String(StringDescriptor),
-    #[br(pre_assert(class > 1 && class != 3))]
+    #[br(pre_assert(class == 9))]
+    Variable(VariableLengthDescriptor),
+    #[br(pre_assert(class > 1 && class != 3 && class != 9))]
     UnimplementedTypeClass,
 }
 
@@ -384,6 +422,22 @@ pub struct StringDescriptor {
     character_set: B4,
     rest: B16,
     size: u32,
+}
+
+#[bitfield(bits = 24)]
+#[derive(BinRead, Debug)]
+#[br(map = Self::from_bytes)]
+pub struct VariableLengthDescriptorBits {
+    variable_type: B4,
+    padding: B4,
+    character_set: B4,
+    rest: B12,
+}
+
+#[derive(BinRead, Debug)]
+pub struct VariableLengthDescriptor {
+    bits: VariableLengthDescriptorBits,
+    parent_type: Box<DatatypeMessage>,
 }
 
 #[derive(BinRead, Debug)]
@@ -479,7 +533,14 @@ struct ObjectHeaderContinuationMessage {
 }
 
 #[derive(BinRead, Debug)]
+struct SymbolTableMessage {
+    btree_address: u64,
+    local_heap_address: u64,
+}
+
+#[derive(BinRead, Debug)]
 struct AttributeMessage {
+    #[br(assert(version == 1))]
     version: u8,
     flags: u8,
     name_size: u16,
@@ -488,9 +549,9 @@ struct AttributeMessage {
 
     #[br(align_after = 8)]
     name: NullString,
-    #[br(align_after = 8)]
+    #[br(pad_size_to = datatype_size.next_multiple_of(8))]
     datatype: DatatypeMessage,
-    #[br(align_after = 8)]
+    #[br(pad_size_to = dataspace_size.next_multiple_of(8))]
     dataspace: DataspaceMessage,
     // TODO - need to calculate this based on dataspace and datatype
     //#[br(count = data_size)]
@@ -527,7 +588,7 @@ mod tests {
     use super::*;
 
     fn get_file() -> Vec<u8> {
-        let mut f = std::fs::File::open("datasets/frozen_pbmc_donor_c_molecule_info.h5").unwrap();
+        let mut f = std::fs::File::open("datasets/gene_bc_matrix.h5").unwrap();
 
         let mut buf = vec![];
         f.read_to_end(&mut buf).unwrap();
@@ -541,23 +602,48 @@ mod tests {
         let mut full_file = Cursor::new(&buf[..]);
 
         let sb = SuperblockV0::read_le(&mut full_file);
-        println!("superblock: {:#?}", sb);
+        println!("superblock: {:#?}, end of sb: {}", sb, full_file.position());
+        let sb = sb.unwrap();
 
-        let mut c = Cursor::new(&buf[0x88..]);
+        full_file.set_position(sb.root_group_symbol_table_entry.object_header_address);
+        let root_group = DataObjectHeader::read_le(&mut full_file);
+        println!("root group orig: {:#?}", root_group);
+        let mut root_group = root_group.unwrap();
+        root_group
+            .load_continuation_messages(&mut full_file)
+            .unwrap();
 
-        let sb = GroupBTreeV1::read_le(&mut c).unwrap();
-        println!("{:#?}", sb);
+        println!("root group new messages: {:#?}", root_group);
 
-        for e in sb.children {
+        let root_group_symbol_table = root_group.symbol_table_message().unwrap();
+
+        full_file.set_position(root_group_symbol_table.btree_address);
+        let root_group_btree = GroupBTreeV1::read_le(&mut full_file).unwrap();
+        println!("root group btree: {:#?}", root_group_btree);
+
+        full_file.set_position(root_group_symbol_table.local_heap_address);
+        let root_group_heap = LocalHeap::read_le(&mut full_file);
+        println!("root group heap: {:#?}", root_group_heap);
+
+        return;
+
+        // load the group object
+        let g0 = &root_group_btree.children[0];
+        full_file.set_position(g0.child_pointer);
+
+        for e in root_group_btree.children {
             let mut c = Cursor::new(&buf[e.child_pointer as usize..]);
             let symbol = GroupSymbolTableNode::read_le(&mut c);
             println!("{:#?}", symbol);
 
-            let ste = &symbol.unwrap().entries[0];
-            let mut c = Cursor::new(&buf[ste.object_header_address as usize..]);
-            let oh = DataObjectHeader::read_le(&mut c);
-            println!("{:#?}", oh);
-
+            //let ste = &symbol.unwrap().entries[0];
+            for ste in &symbol.unwrap().entries {
+                let mut c = Cursor::new(&buf[ste.object_header_address as usize..]);
+                let oh = DataObjectHeader::read_le(&mut c);
+                println!("{:#?}", oh);
+            }
+            continue;
+            /*
             let obj = oh.unwrap();
 
             let Some(HeaderMessage {
@@ -630,8 +716,7 @@ mod tests {
 
                 println!("last pos: {last}, num_chunks: {n}");
             }
-
-            //if  obj.messages.iter().find(|x| matches!(x.inner, InnerMessage::DataLayout(DataLaymoutMessage {inner: DataLayoutChunked {  }, ..}))) {
+            */
         }
     }
 }
