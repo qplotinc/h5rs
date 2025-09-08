@@ -529,7 +529,7 @@ mod tests {
     fn get_file() -> Vec<u8> {
         let mut f = std::fs::File::open("datasets/frozen_pbmc_donor_c_molecule_info.h5").unwrap();
 
-        let mut buf = vec![0; 10_000_000];
+        let mut buf = vec![];
         f.read_to_end(&mut buf).unwrap();
         buf
     }
@@ -541,7 +541,7 @@ mod tests {
         let mut full_file = Cursor::new(&buf[..]);
 
         let sb = SuperblockV0::read_le(&mut full_file);
-        println!("{:#?}", sb);
+        println!("superblock: {:#?}", sb);
 
         let mut c = Cursor::new(&buf[0x88..]);
 
@@ -611,6 +611,7 @@ mod tests {
                 let it = BTreeIter::new(&mut full_file, bt.unwrap());
 
                 let mut last = 0;
+                let mut n = 0;
 
                 for c in it {
                     if c.is_err() {
@@ -623,10 +624,11 @@ mod tests {
                         assert_eq!(delta, dimension_sizes[0] as u64)
                     }
 
-                    last = c.key.offsets[0]
+                    last = c.key.offsets[0];
+                    n += 1;
                 }
 
-                println!("last pos: {last}");
+                println!("last pos: {last}, num_chunks: {n}");
             }
 
             //if  obj.messages.iter().find(|x| matches!(x.inner, InnerMessage::DataLayout(DataLaymoutMessage {inner: DataLayoutChunked {  }, ..}))) {
