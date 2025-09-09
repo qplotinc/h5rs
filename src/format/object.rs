@@ -6,10 +6,7 @@ use binrw::{BinRead, BinResult, NullString};
 
 use crate::{
     Dataset, Group,
-    format::{
-        btree::*,
-        metadata::{GroupBTreeV1, LocalHeap},
-    },
+    format::metadata::{GroupBTreeV1, LocalHeap},
 };
 
 /// Object Header

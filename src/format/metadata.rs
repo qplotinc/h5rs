@@ -176,7 +176,7 @@ pub struct GroupSymbolTableNode {
 
 /// Symbol Table Entry
 /// https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#subsec_fmt4_infra_symboltableentry
-#[derive(BinRead, Debug)]
+#[derive(BinRead, Debug, Clone)]
 pub struct SymbolTableEntry {
     pub link_name_offset: u64,
     pub object_header_address: u64,
