@@ -1,811 +1,128 @@
 #![allow(dead_code)]
-use modular_bitfield::prelude::*;
 use std::io::{Read, Seek, SeekFrom};
 
-use binrw::{BinRead, BinResult, NullString};
+use binrw::{BinRead, BinResult};
 
-#[derive(BinRead, Debug)]
-#[br(magic = b"\x89HDF\r\n\x1a\n")]
-struct SuperblockV0 {
-    superblock_version: u8,
-    free_space_version: u8,
-    root_group_table_version: u8,
+use crate::format::{
+    btree::BTreeIter,
+    metadata::{
+        GroupBTreeV1, GroupPointerV1, GroupSymbolTableNode, LoadedLocalHeap, SymbolTableEntry,
+    },
+    object::{DataLayoutMessage, DataObjectHeader, DataspaceMessage, DatatypeMessage},
+};
 
-    #[br(align_before = 12)]
-    shared_header_version: u8,
-    size_of_offsets: u8,
-    size_of_lengths: u8,
+pub(crate) mod format;
 
-    #[br(align_before = 16)]
-    group_leaf_node_k: u16,
-    group_internal_node_k: u16,
-    file_consistency_flags: u32,
-    // only in v1 of superblock
-    //indexed_storage_internal_node_k: u16,
-    #[br(align_before = 24)]
-    base_address: u64,
-    free_space_info_address: u64,
-    end_of_file_address: u64,
-    driver_info_address: u64,
-    root_group_symbol_table_entry: SymbolTableEntry,
-}
-
-#[derive(BinRead, Debug)]
-#[br(magic = b"\x89HDF\r\n\x1a\n")]
-struct SuperblockV2 {
-    superblock_version: u8,
-    size_of_offsets: u8,
-    size_of_lengths: u8,
-    file_consistency_flags: u8,
-    base_address: u64,
-    superblock_extension_address: [u8; 8],
-    end_of_file_address: [u8; 8],
-    root_group_object_header_address: [u8; 8],
-    superblock_checksum: u32,
-}
-
-/// v1 BTrees
-/// https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#subsubsec_fmt4_infra_btrees_v1
-#[derive(BinRead, Debug)]
-#[br(magic = b"TREE")]
-struct GroupBTreeV1 {
-    #[br(assert(node_type == 0))]
-    node_type: u8,
-    node_level: u8,
-    entries_used: u16,
-    left_address: u64,
-    right_address: u64,
-
-    #[br(count = entries_used)]
-    children: Vec<GroupPointerV1>,
-}
-
-#[derive(BinRead, Debug)]
-struct GroupPointerV1 {
-    key: u64,
-    child_pointer: u64,
-}
-
-#[derive(BinRead, Debug)]
-#[br(magic = b"TREE")]
-#[br(import(dim: u8))]
-struct ChunkBTreeV1 {
-    #[br(assert(node_type == 1))]
-    node_type: u8,
-    node_level: u8,
-    entries_used: u16,
-    left_address: u64,
-    right_address: u64,
-
-    #[br(count = entries_used, args { inner: (dim,) })]
-    children: Vec<ChunkPointerV1>,
-
-    // last key delimits the upper bound of values in the last child.
-    final_key: ChunkKeyV1,
-}
-
-impl BTree for ChunkBTreeV1 {
-    type Leaf = ChunkPointerV1;
-
-    type Args = (u8,);
-
-    fn children(&self) -> &[Self::Leaf] {
-        &self.children
-    }
-
-    fn args(&self) -> Self::Args {
-        (self
-            .children
-            .first()
-            .map(|c| c.dimensionality())
-            .unwrap_or(1),)
-    }
-
-    fn node_level(&self) -> u8 {
-        self.node_level
-    }
-}
-
-#[derive(BinRead, Debug, Clone)]
-#[br(import(dim: u8))]
-struct ChunkPointerV1 {
-    #[br(args(dim,))]
-    key: ChunkKeyV1,
-    child_pointer: u64,
-}
-
-impl HasPointer for ChunkPointerV1 {
-    fn child_pointer(&self) -> u64 {
-        self.child_pointer
-    }
-}
-
-#[derive(BinRead, Debug, Clone)]
-#[br(import(dim: u8))]
-struct ChunkKeyV1 {
-    chunk_size: u32,
-    filter_mask: u32,
-    #[br(count = dim + 1)]
-    offsets: Vec<u64>,
-}
-
-impl ChunkPointerV1 {
-    pub fn dimensionality(&self) -> u8 {
-        (self.key.offsets.len() - 1) as u8
-    }
-}
-
-#[derive(Debug)]
-struct BTreeIter<'a, T, B> {
-    reader: &'a mut T,
-    stack: Vec<(B, usize)>,
-}
-
-impl<'a, T, B> BTreeIter<'a, T, B> {
-    pub fn new(reader: &'a mut T, tree: B) -> BTreeIter<'a, T, B> {
-        BTreeIter {
-            reader,
-            stack: vec![(tree, 0)],
-        }
-    }
-}
-
-trait HasPointer {
-    fn child_pointer(&self) -> u64;
-}
-trait BTree {
-    type Leaf: Clone + HasPointer;
-    type Args;
-    fn children(&self) -> &[Self::Leaf];
-    fn args(&self) -> Self::Args;
-    fn node_level(&self) -> u8;
-}
-enum IterState {
-    Done,
-    NodeDone,
-    InnerNode,
-    LeafNode,
-}
-impl<'a, T: Read + Seek, B: BTree<Args = A> + BinRead<Args<'a> = A>, A> Iterator
-    for BTreeIter<'a, T, B>
-{
-    type Item = BinResult<<B as BTree>::Leaf>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        use IterState::*;
-
-        loop {
-            let state = match self.stack.last() {
-                None => IterState::Done,
-                Some((node, pos)) if node.children().len() == *pos => NodeDone,
-                Some((node, _)) if node.node_level() > 0 => InnerNode,
-                Some((_, _)) => LeafNode,
-            };
-
-            match state {
-                IterState::Done => return None,
-                IterState::NodeDone => {
-                    let _ = self.stack.pop();
-                }
-                IterState::InnerNode => {
-                    // Need to expand down a level.
-                    let child_node = {
-                        let Some((node, pos)) = self.stack.last_mut() else {
-                            unreachable!();
-                        };
-                        self.reader
-                            .seek(SeekFrom::Start(node.children()[*pos].child_pointer()))
-                            .ok()?;
-                        *pos += 1;
-
-                        let args = node.args();
-                        B::read_le_args(self.reader, args).ok()?
-                    };
-
-                    self.stack.push((child_node, 0));
-                }
-                IterState::LeafNode => {
-                    let Some((node, pos)) = self.stack.last_mut() else {
-                        unreachable!();
-                    };
-                    let leaf = node.children()[*pos].clone();
-                    *pos += 1;
-                    return Some(Ok(leaf));
-                }
-            };
-        }
-    }
-}
-
-/// Group Symbol Table Node
-/// https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#subsec_fmt4_infra_symboltable
-#[derive(BinRead, Debug)]
-#[br(magic = b"SNOD")]
-struct GroupSymbolTableNode {
-    verion: u8,
-    reserved: u8,
-    number_of_symbols: u16,
-
-    #[br(count = number_of_symbols)]
-    entries: Vec<SymbolTableEntry>,
-}
-
-/// Symbol Table Entry
-/// https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#subsec_fmt4_infra_symboltableentry
-#[derive(BinRead, Debug)]
-struct SymbolTableEntry {
-    link_name_offset: u64,
-    object_header_address: u64,
-    #[br(pad_after = 20)]
-    cache_type: u32,
-    // don't need to read these, so pad them out with pad_after=20
-    //reserved: u32,
-    //scratch_pad: [u8; 16],
-}
-
-/// Local Heap
-/// https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#subsec_fmt4_infra_localheap
-#[derive(BinRead, Debug)]
-#[br(magic = b"HEAP")]
-struct LocalHeap {
-    #[br(pad_after = 3)]
-    verion: u8,
-    data_segment_size: u64,
-    offest_to_head_of_free_list: u64,
-    data_segment_address: u64,
-}
-
-/// Object Header
-/// https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#sec_fmt4_dataobject
-#[derive(BinRead, Debug)]
-struct DataObjectHeader {
-    version: u8,
-    #[br(pad_before = 1)]
-    total_header_messages: u16,
-    object_reference_count: u32,
-    #[br(pad_after = 4)]
-    object_header_size: u32,
-
-    #[br(parse_with = parse_header_list, args(object_header_size))]
-    messages: Vec<HeaderMessage>,
-}
-
-#[derive(BinRead, Debug)]
-#[br(import(object_header_size: u32))]
-struct MessageList {
-    #[br(parse_with = parse_header_list, args(object_header_size))]
-    messages: Vec<HeaderMessage>,
-}
-
-impl DataObjectHeader {
-    fn symbol_table_message(&self) -> Option<&SymbolTableMessage> {
-        self.messages.iter().find_map(|x| match &x.inner {
-            InnerMessage::SymbolTable(s) => Some(s),
-            _ => None,
-        })
-    }
-
-    fn dataspace_message(&self) -> Option<&DataspaceMessage> {
-        self.messages.iter().find_map(|x| match &x.inner {
-            InnerMessage::Dataspace(s) => Some(s),
-            _ => None,
-        })
-    }
-
-    fn datatype_message(&self) -> Option<&DatatypeMessage> {
-        self.messages.iter().find_map(|x| match &x.inner {
-            InnerMessage::Datatype(s) => Some(s),
-            _ => None,
-        })
-    }
-
-    fn data_layout_message(&self) -> Option<&DataLayoutMessage> {
-        self.messages.iter().find_map(|x| match &x.inner {
-            InnerMessage::DataLayout(s) => Some(s),
-            _ => None,
-        })
-    }
-
-    pub fn load_continuation_messages<R: Read + Seek>(&mut self, reader: &mut R) -> BinResult<()> {
-        let mut new_messages = vec![];
-        for m in self.messages.iter() {
-            let InnerMessage::ObjectHeaderContinuation(m) = &m.inner else {
-                continue;
-            };
-
-            reader.seek(SeekFrom::Start(m.offset))?;
-            let msg = MessageList::read_le_args(reader, (m.length as u32,))?;
-            new_messages.extend(msg.messages);
-        }
-
-        self.messages.extend(new_messages);
-        Ok(())
-    }
-
-    pub fn to_group<R: Read + Seek>(&self, name: String, r: &mut R) -> Option<BinResult<Group>> {
-        let Some(stm) = self.symbol_table_message() else {
-            return None;
-        };
-
-        r.seek(SeekFrom::Start(stm.btree_address)).ok()?;
-        let btree = GroupBTreeV1::read_le(r).ok()?;
-
-        r.seek(SeekFrom::Start(stm.local_heap_address)).ok()?;
-        let local_heap = LocalHeap::read_le(r).ok()?;
-
-        Some(Ok(Group {
-            name,
-            btree,
-            local_heap,
-        }))
-    }
-
-    pub fn to_dataset(&self, name: String) -> Option<BinResult<Dataset>> {
-        let Some(dataspace) = self.dataspace_message() else {
-            return None;
-        };
-
-        let Some(datatype) = self.datatype_message() else {
-            return None;
-        };
-
-        let Some(layout) = self.data_layout_message() else {
-            return None;
-        };
-
-        Some(Ok(Dataset {
-            dataspace: dataspace.clone(),
-            datatype: datatype.clone(),
-            layout: layout.clone(),
-        }))
-    }
+struct Object {
+    name: String,
+    header: DataObjectHeader,
 }
 
 struct Group {
     name: String,
     btree: GroupBTreeV1,
-    local_heap: LocalHeap,
+    loaded_local_heap: LoadedLocalHeap,
+}
+
+struct GroupObjectIter<'a, R> {
+    group: &'a Group,
+    reader: &'a mut R,
+    btree_iter: BTreeIter<'a, R, GroupBTreeV1>,
+    current_symbol_table: Option<GroupSymbolTableNode>,
+    symbol_table_pos: usize,
+}
+
+impl<'a, R: Read + Seek> Iterator for GroupObjectIter<'a, R> {
+    type Item = BinResult<Object>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // check if we're done with the current ST
+        if let Some(st) = &self.current_symbol_table {
+            if self.symbol_table_pos == st.entries.len() {
+                self.current_symbol_table = None;
+            }
+        }
+
+        if self.current_symbol_table.is_none() {
+            let ptr = self.btree_iter.next()?;
+            match ptr {
+                Ok(p) => {
+                    let st = self.group.load_symbol_table(&p, self.reader);
+                    match st {
+                        Ok(st) => {
+                            self.current_symbol_table = Some(st);
+                            self.symbol_table_pos = 0;
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        let Some(st) = &self.current_symbol_table else {
+            return None;
+        };
+
+        let e = &st.entries[self.symbol_table_pos];
+        self.symbol_table_pos += 1;
+        Some(self.group.load_object(e, self.reader))
+    }
+}
+
+impl Group {
+    fn iter_objects<'a, R: Read + Seek>(&'a self, reader: &'a mut R) -> GroupObjectIter<'a, R> {
+        let it = BTreeIter::new(reader, self.btree.clone());
+
+        GroupObjectIter {
+            group: self,
+            reader,
+            btree_iter: it,
+            current_symbol_table: None,
+            symbol_table_pos: 0,
+        }
+    }
+
+    fn load_symbol_table<R: Read + Seek>(
+        &self,
+        ptr: &GroupPointerV1,
+        reader: &mut R,
+    ) -> BinResult<GroupSymbolTableNode> {
+        reader.seek(SeekFrom::Start(ptr.child_pointer))?;
+        GroupSymbolTableNode::read_le(reader)
+    }
+
+    fn iter_symbol_table<R: Read + Seek>(
+        &self,
+        symbol_table: &GroupSymbolTableNode,
+        reader: &mut R,
+    ) -> impl Iterator<Item = BinResult<Object>> {
+        symbol_table
+            .entries
+            .iter()
+            .map(|e| self.load_object(e, reader))
+    }
+
+    fn load_object<R: Read + Seek>(
+        &self,
+        ptr: &SymbolTableEntry,
+        reader: &mut R,
+    ) -> BinResult<Object> {
+        let name = self.loaded_local_heap.get_string(ptr.link_name_offset)?;
+
+        reader.seek(SeekFrom::Start(ptr.object_header_address))?;
+        let header = DataObjectHeader::read_le(reader)?;
+
+        Ok(Object { name, header })
+    }
+
+    // FIXME: this loads the object header of every object - we can avoid this while
+    // looking for an object by name, if needed.
+    fn find_obj<R: Read + Seek>(&self, name: impl AsRef<str>, reader: &mut R) -> Object {}
 }
 
 struct Dataset {
     dataspace: DataspaceMessage,
     datatype: DatatypeMessage,
     layout: DataLayoutMessage,
-}
-
-/// Need a custom parser for the Header Message list: we
-/// don't know how many messages will be in this block,
-/// we only know the total size of the header. So this method
-/// tracks the total size and stops when the correct size when the
-/// size has been reached.
-#[binrw::parser(reader, endian)]
-fn parse_header_list(object_header_size: u32) -> BinResult<Vec<HeaderMessage>> {
-    // header size does not include reserved space after object_header_size
-    let mut total_size = 0;
-    let mut headers = vec![];
-    while total_size < object_header_size {
-        let h = HeaderMessage::read_options(reader, endian, ())?;
-        // each message has 8 bytes of header, plus the data_size of the message
-        total_size += 8 + h.data_size as u32;
-        headers.push(h);
-    }
-
-    Ok(headers)
-}
-
-#[derive(BinRead, Debug)]
-struct HeaderMessage {
-    message_type: u16,
-    data_size: u16,
-    #[br(pad_after = 3)]
-    flags: u8,
-    #[br(args{ ty: message_type, data_size})]
-    #[br(pad_size_to = data_size)]
-    inner: InnerMessage,
-}
-
-#[derive(BinRead, Debug)]
-#[br(import { ty: u16, data_size: u16 })]
-enum InnerMessage {
-    #[br(pre_assert(ty == 0))]
-    Nil(NilMessage),
-    #[br(pre_assert(ty == 1))]
-    Dataspace(DataspaceMessage),
-    #[br(pre_assert(ty == 3))]
-    Datatype(DatatypeMessage),
-    #[br(pre_assert(ty == 5))]
-    FillValue(FillValueMessage),
-    #[br(pre_assert(ty == 8))]
-    DataLayout(DataLayoutMessage),
-    #[br(pre_assert(ty == 12))]
-    Attribute(AttributeMessage),
-    #[br(pre_assert(ty == 16))]
-    ObjectHeaderContinuation(ObjectHeaderContinuationMessage),
-    #[br(pre_assert(ty == 17))]
-    SymbolTable(SymbolTableMessage),
-    #[br(pre_assert(ty == 18))]
-    ModificationTie(ModificationTimMessage),
-    #[br(pre_assert(ty != 12 && ty != 3 && ty != 8))]
-    Unknown(#[br(args{data_size})] UnknownMessage),
-}
-
-#[derive(BinRead, Debug)]
-struct NilMessage {}
-
-#[derive(BinRead, Debug, Clone)]
-struct DataspaceMessage {
-    #[br(assert(version == 1))]
-    version: u8,
-    dimensionality: u8,
-    #[br(pad_after = 5)]
-    flags: u8,
-    //reserved1: u8,
-    //reserved2: u32,
-    #[br(count = dimensionality)]
-    dimension: Vec<u64>,
-
-    #[br(count = dimensionality)]
-    dimension_max: Vec<u64>,
-
-    #[br(count = dimensionality, if(flags & 0x2 > 0))]
-    permutation_index: Option<Vec<u64>>,
-}
-
-#[derive(BinRead, Debug, Clone)]
-struct DatatypeMessage {
-    version_and_class: VersionAndClass,
-    #[br(args { class: version_and_class.class() })]
-    type_desc: TypeDescriptor,
-}
-
-#[bitfield]
-#[derive(BinRead, Debug, Clone)]
-#[br(map = Self::from_bytes)]
-pub struct VersionAndClass {
-    class: B4,
-    version: B4,
-}
-
-#[derive(BinRead, Debug, Clone)]
-#[br(import { class: u8 })]
-enum TypeDescriptor {
-    #[br(pre_assert(class == 0))]
-    FixedPoint(FixedPointDescriptor),
-    #[br(pre_assert(class == 1))]
-    FloatingPoint(FloatingPointDescriptor),
-    #[br(pre_assert(class == 3))]
-    String(StringDescriptor),
-    #[br(pre_assert(class == 9))]
-    Variable(VariableLengthDescriptor),
-    #[br(pre_assert(class > 1 && class != 3 && class != 9))]
-    UnimplementedTypeClass,
-}
-
-#[bitfield(bits = 88)]
-#[derive(BinRead, Debug, Clone)]
-#[br(map = Self::from_bytes)]
-pub struct FixedPointDescriptor {
-    byte_order: B1,
-    low_padding: B1,
-    high_padding: B1,
-    signed: B1,
-    rest: B20,
-    size: u32,
-    bit_offset: u16,
-    bit_precision: u16,
-}
-
-#[bitfield(bits = 152)]
-#[derive(BinRead, Debug, Clone)]
-#[br(map = Self::from_bytes)]
-pub struct FloatingPointDescriptor {
-    byte_order: B1,
-    low_padding: B1,
-    high_padding: B1,
-    internal_padding: B1,
-    mantissa_normalization: B2,
-    reserved: B2,
-    sign_location: u8,
-    rest: u8,
-    size: u32,
-    bit_offset: u16,
-    bit_precision: u16,
-    exponent_location: u8,
-    exponent_size: u8,
-    mantissa_location: u8,
-    mantissa_size: u8,
-    exponent_bias: u32,
-}
-
-#[bitfield(bits = 56)]
-#[derive(BinRead, Debug, Clone)]
-#[br(map = Self::from_bytes)]
-pub struct StringDescriptor {
-    padding: B4,
-    character_set: B4,
-    rest: B16,
-    size: u32,
-}
-
-#[bitfield(bits = 24)]
-#[derive(BinRead, Debug, Clone)]
-#[br(map = Self::from_bytes)]
-pub struct VariableLengthDescriptorBits {
-    variable_type: B4,
-    padding: B4,
-    character_set: B4,
-    rest: B12,
-}
-
-#[derive(BinRead, Debug, Clone)]
-pub struct VariableLengthDescriptor {
-    bits: VariableLengthDescriptorBits,
-    parent_type: Box<DatatypeMessage>,
-}
-
-#[derive(BinRead, Debug)]
-struct FillValueMessage {
-    //#[br(assert(version == 1))]
-    version: u8,
-    space_allocation_time: u8,
-    fill_value_write_time: u8,
-    fill_value_defined: u8,
-
-    #[br(if(fill_value_defined == 1))]
-    size: Option<u32>,
-
-    #[br(if(fill_value_defined == 1))]
-    #[br(count = size.unwrap())]
-    fill_value: Option<Vec<u8>>,
-}
-
-#[derive(BinRead, Debug, Clone)]
-struct DataLayoutMessage {
-    version: u8,
-    #[br(args { version })]
-    inner: DataLayoutInner,
-}
-
-#[derive(BinRead, Debug, Clone)]
-#[br(import { version: u8 })]
-enum DataLayoutInner {
-    #[br(pre_assert(version < 3))]
-    V12(DataLayoutV12),
-    #[br(pre_assert(version == 3))]
-    V3(DataLayoutV3),
-}
-
-#[derive(BinRead, Debug, Clone)]
-struct DataLayoutV12 {
-    dimensionality: u8,
-    #[br(pad_after = 5)]
-    layout_class: u8,
-
-    #[br(if(layout_class > 0))]
-    data_address: Option<u64>,
-
-    #[br(count = dimensionality)]
-    dimension: Vec<u64>,
-}
-
-#[derive(BinRead, Debug, Clone)]
-struct DataLayoutV3 {
-    layout_class: u8,
-    #[br(args { layout_class })]
-    layout_inner: LayoutInner,
-}
-
-#[derive(BinRead, Debug, Clone)]
-#[br(import { layout_class: u8 })]
-enum LayoutInner {
-    #[br(pre_assert(layout_class == 0))]
-    Compact(DataLayoutCompact),
-    #[br(pre_assert(layout_class == 1))]
-    Contiguous(DataLayoutContiguous),
-    #[br(pre_assert(layout_class == 2))]
-    Chunked(DataLayoutChunked),
-}
-
-#[derive(BinRead, Debug, Clone)]
-struct DataLayoutCompact {
-    size: u16,
-    #[br(count = size)]
-    data: Vec<u8>,
-}
-
-#[derive(BinRead, Debug, Clone)]
-struct DataLayoutContiguous {
-    address: u64,
-    size: u64,
-}
-
-#[derive(BinRead, Debug, Clone)]
-struct DataLayoutChunked {
-    dimensionality: u8,
-    /// Pointer to a Version 1 B-Tree of the chunk data.
-    address: u64,
-    #[br(count = dimensionality)]
-    dimension_sizes: Vec<u32>,
-    dataset_element_size: u32,
-}
-
-#[derive(BinRead, Debug)]
-struct ObjectHeaderContinuationMessage {
-    offset: u64,
-    length: u64,
-}
-
-#[derive(BinRead, Debug)]
-struct SymbolTableMessage {
-    btree_address: u64,
-    local_heap_address: u64,
-}
-
-#[derive(BinRead, Debug)]
-struct AttributeMessage {
-    #[br(assert(version == 1))]
-    version: u8,
-    flags: u8,
-    name_size: u16,
-    datatype_size: u16,
-    dataspace_size: u16,
-
-    #[br(align_after = 8)]
-    name: NullString,
-    #[br(pad_size_to = datatype_size.next_multiple_of(8))]
-    datatype: DatatypeMessage,
-    #[br(pad_size_to = dataspace_size.next_multiple_of(8))]
-    dataspace: DataspaceMessage,
-    // TODO - need to calculate this based on dataspace and datatype
-    //#[br(count = data_size)]
-    //message: Vec<u8>,
-}
-
-#[derive(BinRead, Debug)]
-struct ModificationTimMessage {
-    #[br(pad_after = 3)]
-    version: u8,
-    /// modification time in seconds after epoch
-    modification_time: u32,
-}
-
-#[derive(BinRead)]
-#[br(import { data_size: u16 })]
-struct UnknownMessage {
-    #[br(count = data_size)]
-    message: Vec<u8>,
-}
-
-impl std::fmt::Debug for UnknownMessage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UnknownMessage")
-            .field("length", &self.message.len())
-            .finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::{Cursor, Read};
-
-    use super::*;
-
-    fn get_file() -> Vec<u8> {
-        let mut f = std::fs::File::open("datasets/gene_bc_matrix.h5").unwrap();
-
-        let mut buf = vec![];
-        f.read_to_end(&mut buf).unwrap();
-        buf
-    }
-
-    #[test]
-    fn basic() {
-        let buf = get_file();
-
-        let mut full_file = Cursor::new(&buf[..]);
-
-        let sb = SuperblockV0::read_le(&mut full_file);
-        println!("superblock: {:#?}, end of sb: {}", sb, full_file.position());
-        let sb = sb.unwrap();
-
-        full_file.set_position(sb.root_group_symbol_table_entry.object_header_address);
-        let root_group = DataObjectHeader::read_le(&mut full_file);
-        println!("root group orig: {:#?}", root_group);
-        let mut root_group = root_group.unwrap();
-        root_group
-            .load_continuation_messages(&mut full_file)
-            .unwrap();
-
-        println!("root group new messages: {:#?}", root_group);
-
-        let root_group_symbol_table = root_group.symbol_table_message().unwrap();
-
-        let rg = root_group
-            .to_group("/".to_string(), &mut full_file)
-            .unwrap()
-            .unwrap();
-
-        full_file.set_position(root_group_symbol_table.btree_address);
-        let root_group_btree = GroupBTreeV1::read_le(&mut full_file).unwrap();
-        println!("root group btree: {:#?}", root_group_btree);
-
-        full_file.set_position(root_group_symbol_table.local_heap_address);
-        let root_group_heap = LocalHeap::read_le(&mut full_file);
-        println!("root group heap: {:#?}", root_group_heap);
-
-        // load the group object
-        let g0 = &root_group_btree.children[0];
-        full_file.set_position(g0.child_pointer);
-
-        for e in root_group_btree.children {
-            let mut c = Cursor::new(&buf[e.child_pointer as usize..]);
-            let symbol = GroupSymbolTableNode::read_le(&mut c);
-            println!("{:#?}", symbol);
-
-            let ste = &symbol.unwrap().entries[0];
-            //for ste in &symbol.unwrap().entries {
-            let mut c = Cursor::new(&buf[ste.object_header_address as usize..]);
-            let oh = DataObjectHeader::read_le(&mut c);
-            println!("{:#?}", oh);
-            //}
-
-            let obj = oh.unwrap();
-
-            let ds = obj.to_dataset("adsf".to_string()).unwrap().unwrap();
-            test_chunk_iter(&ds, &mut full_file).unwrap();
-        }
-    }
-
-    fn test_chunk_iter<R: Read + Seek>(dataset: &Dataset, reader: &mut R) -> BinResult<()> {
-        let d = dataset.dataspace.dimensionality;
-
-        let DataLayoutMessage {
-            inner:
-                DataLayoutInner::V3(DataLayoutV3 {
-                    layout_inner:
-                        LayoutInner::Chunked(
-                            DataLayoutChunked {
-                                address,
-                                dimension_sizes,
-                                ..
-                            },
-                            ..,
-                        ),
-                    ..
-                }),
-            ..
-        } = &dataset.layout
-        else {
-            return Ok(());
-        };
-
-        // now load a B-Tree at address
-        let _ = reader.seek(SeekFrom::Start(*address))?;
-        let bt = ChunkBTreeV1::read_le_args(reader, (d,));
-
-        println!("dataset is chunked. reading B-Tree:\n{:#?}", bt);
-
-        let it = BTreeIter::new(reader, bt.unwrap());
-
-        let mut last = 0;
-        let mut n = 0;
-
-        for c in it {
-            if c.is_err() {
-                println!("btree err: {:?}", c);
-            }
-
-            let c = c.unwrap();
-            let delta = c.key.offsets[0] - last;
-            if c.key.offsets[0] > 0 {
-                assert_eq!(delta, dimension_sizes[0] as u64)
-            }
-
-            last = c.key.offsets[0];
-            n += 1;
-        }
-
-        println!("last pos: {last}, num_chunks: {n}");
-        Ok(())
-    }
 }
