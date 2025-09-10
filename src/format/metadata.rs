@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use modular_bitfield::prelude::*;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use binrw::{BinRead, BinResult, NullString};
@@ -201,8 +200,7 @@ pub struct LocalHeap {
 
 impl LocalHeap {
     pub fn load<R: Read + Seek>(&self, reader: &mut R) -> BinResult<LoadedLocalHeap> {
-        reader.seek(SeekFrom::Start(self.data_segment_address));
-
+        reader.seek(SeekFrom::Start(self.data_segment_address))?;
         let mut data = vec![0u8; self.data_segment_size as usize];
         reader.read_exact(&mut data[..])?;
 

@@ -1,5 +1,3 @@
-use crate::format::metadata::SuperblockV0;
-
 pub mod btree;
 pub mod metadata;
 pub mod object;
@@ -21,8 +19,6 @@ mod tests {
             },
         },
     };
-
-    use super::*;
 
     fn get_file() -> Vec<u8> {
         let mut f = std::fs::File::open("datasets/gene_bc_matrix.h5").unwrap();

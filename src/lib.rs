@@ -15,7 +15,7 @@ use crate::format::{
     },
     object::{
         DataLayoutChunked, DataLayoutInner, DataLayoutMessage, DataLayoutV3, DataObjectHeader,
-        DataspaceMessage, DatatypeMessage, LayoutInner,
+        DataspaceMessage, DatatypeMessage, FilterMessage, LayoutInner,
     },
 };
 
@@ -52,6 +52,12 @@ impl File {
 struct Object {
     name: String,
     header: DataObjectHeader,
+}
+
+impl Object {
+    pub fn to_group<R: Read + Seek>(&self, r: &mut R) -> BinResult<Option<Group>> {
+        self.header.to_group(self.name.clone(), r).transpose()
+    }
 }
 
 struct Group {
@@ -133,7 +139,6 @@ impl Group {
         reader: &mut R,
     ) -> BinResult<Option<Object>> {
         let r = self.object_refs(reader)?;
-        println!("refs:{:?}", r);
         let Some((name, ste)) = r.iter().find(|(n, _)| n == name.as_ref()) else {
             println!("didn't find object: {}", name.as_ref());
             return Ok(None);
@@ -151,9 +156,11 @@ impl Group {
 }
 
 struct Dataset {
+    name: String,
     dataspace: DataspaceMessage,
     datatype: DatatypeMessage,
     layout: DataLayoutMessage,
+    filter: Option<FilterMessage>,
 }
 
 impl Dataset {
@@ -171,23 +178,28 @@ impl Dataset {
         };
 
         Some(ChunkedDataset {
+            name: self.name.clone(),
             dataspace: self.dataspace.clone(),
             datatype: self.datatype.clone(),
             layout: self.layout.clone(),
+            filter: self.filter.clone(),
             chunks_layout: chunk,
         })
     }
 }
 
 struct ChunkedDataset {
+    name: String,
     dataspace: DataspaceMessage,
     datatype: DatatypeMessage,
     layout: DataLayoutMessage,
     chunks_layout: DataLayoutChunked,
+    filter: Option<FilterMessage>,
 }
 
 impl ChunkedDataset {
-    pub fn read_chunk<R: Read + Seek>(
+    // FIXME - support different datatypes
+    pub fn read_chunk_simple<R: Read + Seek>(
         &self,
         c: &ChunkPointerV1,
         reader: &mut R,
@@ -196,9 +208,35 @@ impl ChunkedDataset {
 
         let mut result = vec![0u32; n as usize];
         let read_target: &mut [u8] = bytemuck::cast_slice_mut(&mut result);
+        // make sure we got the right size to read
+        assert_eq!(read_target.len(), c.key.chunk_size as usize);
 
         reader.seek(SeekFrom::Start(c.child_pointer))?;
         reader.read_exact(read_target)?;
+
+        Ok(result)
+    }
+
+    // FIXME - support different datatypes
+    pub fn read_chunk_filter<R: Read + Seek>(
+        &self,
+        c: &ChunkPointerV1,
+        reader: &mut R,
+    ) -> BinResult<Vec<u32>> {
+        let n: u32 = self.chunks_layout.dimension_sizes.iter().product();
+        let mut result = vec![0u32; n as usize];
+
+        let read_target: &mut [u8] = bytemuck::cast_slice_mut(&mut result);
+        // make sure we got the right size to read
+        assert_eq!(read_target.len(), c.key.chunk_size as usize);
+
+        // FIXME - just hardcoding gzip + shuffle right now.
+        reader.seek(SeekFrom::Start(c.child_pointer))?;
+        let mut gz = flate2::read::GzDecoder::new(reader);
+
+        gz.read_exact(read_target)?;
+
+        // now de-shuffle somehow.
 
         Ok(result)
     }
@@ -229,6 +267,7 @@ mod test {
     use ndarray::s;
 
     const MOL_INFO_FILE: &str = "datasets/frozen_pbmc_donor_c_molecule_info.h5";
+    const MATRIX_FILE: &str = "datasets/gene_bc_matrix.h5";
 
     fn load_ds() -> Result<()> {
         let f = hdf5::File::open(MOL_INFO_FILE).unwrap();
@@ -262,9 +301,26 @@ mod test {
             .unwrap()
             .unwrap();
 
-        let chunk = cds.read_chunk(&chunk, &mut *rc.borrow_mut()).unwrap();
+        let chunk = cds
+            .read_chunk_simple(&chunk, &mut *rc.borrow_mut())
+            .unwrap();
         println!("my chunk: {:?}", &chunk[..16]);
 
+        Ok(())
+    }
+
+    #[test]
+    fn filters() -> BinResult<()> {
+        let mut rdr = std::io::BufReader::new(std::fs::File::open(MATRIX_FILE).unwrap());
+        let f = super::File::open(&mut rdr)?;
+
+        let obj = f.root_group.find_obj("matrix", &mut rdr)?;
+        let o = obj.unwrap();
+        let g = o.to_group(&mut rdr)?.unwrap();
+
+        let data = g.find_obj("data", &mut rdr)?.unwrap();
+
+        println!("data matrix: {:#?}", data.header);
         Ok(())
     }
 }

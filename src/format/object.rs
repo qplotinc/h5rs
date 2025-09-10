@@ -60,6 +60,13 @@ impl DataObjectHeader {
         })
     }
 
+    pub fn filter_message(&self) -> Option<&FilterMessage> {
+        self.messages.iter().find_map(|x| match &x.inner {
+            InnerMessage::Filter(s) => Some(s),
+            _ => None,
+        })
+    }
+
     pub fn load_continuation_messages<R: Read + Seek>(&mut self, reader: &mut R) -> BinResult<()> {
         let mut new_messages = vec![];
         for m in self.messages.iter() {
@@ -113,9 +120,11 @@ impl DataObjectHeader {
         };
 
         Some(Dataset {
+            name,
             dataspace: dataspace.clone(),
             datatype: datatype.clone(),
             layout: layout.clone(),
+            filter: self.filter_message().cloned(),
         })
     }
 }
@@ -164,6 +173,8 @@ enum InnerMessage {
     FillValue(FillValueMessage),
     #[br(pre_assert(ty == 8))]
     DataLayout(DataLayoutMessage),
+    #[br(pre_assert(ty == 11))]
+    Filter(FilterMessage),
     #[br(pre_assert(ty == 12))]
     Attribute(AttributeMessage),
     #[br(pre_assert(ty == 16))]
@@ -172,7 +183,7 @@ enum InnerMessage {
     SymbolTable(SymbolTableMessage),
     #[br(pre_assert(ty == 18))]
     ModificationTie(ModificationTimMessage),
-    #[br(pre_assert(ty != 12 && ty != 3 && ty != 8))]
+    #[br(pre_assert(ty != 12 && ty != 3 && ty != 8 && ty != 11))]
     Unknown(#[br(args{data_size})] UnknownMessage),
 }
 
@@ -386,6 +397,45 @@ struct ObjectHeaderContinuationMessage {
 pub struct SymbolTableMessage {
     pub btree_address: u64,
     pub local_heap_address: u64,
+}
+
+#[derive(BinRead, Debug, Clone)]
+pub struct FilterMessage {
+    pub version: u8,
+    #[br(pad_after = 6)]
+    pub num_filters: u8,
+
+    #[br(count = num_filters)]
+    pub filters: Vec<FilterDescription>,
+}
+
+#[derive(BinRead, Debug, Clone)]
+#[br(repr = u16)]
+pub enum FilterType {
+    None = 0,
+    Deflate = 1,
+    Shuffle = 2,
+    Fletcher32 = 3,
+    Szip = 4,
+    Nbit = 5,
+    ScaleOffset = 6,
+}
+
+#[derive(BinRead, Debug, Clone)]
+pub struct FilterDescription {
+    pub filter_type: FilterType,
+    pub name_length: u16,
+    pub flags: u16,
+    pub number_of_client_values: u16,
+
+    #[br(if(name_length > 0), pad_size_to = name_length)]
+    pub name: Option<NullString>,
+
+    // FIXME -- this field needs to be padded so that the length is a multiple of 8.
+    // but this field may not be 8-byte aligned in the file. So we'll pad up the count.
+    // this will lead to 1 extra value in the array if the true length is odd.
+    #[br(count = number_of_client_values.next_multiple_of(2))]
+    pub client_data: Vec<u32>,
 }
 
 #[derive(BinRead, Debug)]
