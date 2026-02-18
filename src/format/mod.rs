@@ -4,88 +4,79 @@ pub mod object;
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Read, Seek, SeekFrom};
-
-    use binrw::{BinRead, BinResult};
+    use object_store::{local::LocalFileSystem, path::Path};
 
     use crate::{
         Dataset,
+        error::H5Result,
         format::{
-            btree::BTreeIter,
-            metadata::{ChunkBTreeV1, GroupBTreeV1, GroupSymbolTableNode, LocalHeap, SuperblockV0},
+            btree::collect_btree_leaves_args,
+            metadata::{ChunkBTreeV1, GroupBTreeV1, SuperblockV0},
             object::{
                 DataLayoutChunked, DataLayoutInner, DataLayoutMessage, DataLayoutV3,
                 DataObjectHeader, LayoutInner,
             },
         },
+        object_store::{ObjectStoreFile, read_metadata, read_metadata_args},
     };
 
-    fn get_file() -> Vec<u8> {
-        let mut f = std::fs::File::open("datasets/gene_bc_matrix.h5").unwrap();
-
-        let mut buf = vec![];
-        f.read_to_end(&mut buf).unwrap();
-        buf
+    fn test_file(path: &str) -> ObjectStoreFile {
+        let cwd = std::env::current_dir().unwrap();
+        let store = LocalFileSystem::new_with_prefix(&cwd).unwrap();
+        ObjectStoreFile::new(Box::new(store), Path::from(path))
     }
 
-    #[test]
-    fn basic() {
-        let buf = get_file();
+    #[tokio::test]
+    async fn basic() -> H5Result<()> {
+        let file = test_file("datasets/gene_bc_matrix.h5");
 
-        let mut full_file = Cursor::new(&buf[..]);
+        let sb: SuperblockV0 = read_metadata(&file, 0).await?;
+        println!("superblock: {:#?}", sb);
 
-        let sb = SuperblockV0::read_le(&mut full_file);
-        println!("superblock: {:#?}, end of sb: {}", sb, full_file.position());
-        let sb = sb.unwrap();
-
-        full_file.set_position(sb.root_group_symbol_table_entry.object_header_address);
-        let root_group = DataObjectHeader::read_le(&mut full_file);
+        let mut root_group: DataObjectHeader = read_metadata(
+            &file,
+            sb.root_group_symbol_table_entry.object_header_address,
+        )
+        .await?;
         println!("root group orig: {:#?}", root_group);
-        let mut root_group = root_group.unwrap();
-        root_group
-            .load_continuation_messages(&mut full_file)
-            .unwrap();
 
+        root_group.load_continuation_messages(&file).await?;
         println!("root group new messages: {:#?}", root_group);
 
         let root_group_symbol_table = root_group.symbol_table_message().unwrap();
 
         let rg = root_group
-            .to_group("/".to_string(), &mut full_file)
-            .unwrap()
-            .unwrap();
+            .to_group("/".to_string(), &file)
+            .await
+            .unwrap()?;
 
-        full_file.set_position(root_group_symbol_table.btree_address);
-        let root_group_btree = GroupBTreeV1::read_le(&mut full_file).unwrap();
+        let root_group_btree: GroupBTreeV1 =
+            read_metadata(&file, root_group_symbol_table.btree_address).await?;
         println!("root group btree: {:#?}", root_group_btree);
 
-        full_file.set_position(root_group_symbol_table.local_heap_address);
-        let root_group_heap = LocalHeap::read_le(&mut full_file);
+        let root_group_heap: crate::format::metadata::LocalHeap =
+            read_metadata(&file, root_group_symbol_table.local_heap_address).await?;
         println!("root group heap: {:#?}", root_group_heap);
 
-        // load the group object
+        // load a child object to exercise symbol table reading
         let g0 = &root_group_btree.children[0];
-        full_file.set_position(g0.child_pointer);
+        let symbol: crate::format::metadata::GroupSymbolTableNode =
+            read_metadata(&file, g0.child_pointer).await?;
+        println!("{:#?}", symbol);
 
-        for e in root_group_btree.children {
-            let mut c = Cursor::new(&buf[e.child_pointer as usize..]);
-            let symbol = GroupSymbolTableNode::read_le(&mut c);
-            println!("{:#?}", symbol);
+        let ste = &symbol.entries[0];
+        let obj: DataObjectHeader =
+            read_metadata(&file, ste.object_header_address).await?;
+        println!("{:#?}", obj);
 
-            let ste = &symbol.unwrap().entries[0];
-            //for ste in &symbol.unwrap().entries {
-            let mut c = Cursor::new(&buf[ste.object_header_address as usize..]);
-            let oh = DataObjectHeader::read_le(&mut c);
-            println!("{:#?}", oh);
-            let obj = oh.unwrap();
-
-            if let Some(ds) = obj.to_dataset("asdf".to_string()) {
-                test_chunk_iter(&ds, &mut full_file).unwrap();
-            }
+        if let Some(ds) = obj.to_dataset("asdf".to_string()) {
+            test_chunk_iter(&ds, &file).await?;
         }
+
+        Ok(())
     }
 
-    fn test_chunk_iter<R: Read + Seek>(dataset: &Dataset, reader: &mut R) -> BinResult<()> {
+    async fn test_chunk_iter(dataset: &Dataset, file: &ObjectStoreFile) -> H5Result<()> {
         let d = dataset.dataspace.dimensionality;
 
         let DataLayoutMessage {
@@ -108,23 +99,15 @@ mod tests {
             return Ok(());
         };
 
-        // now load a B-Tree at address
-        let _ = reader.seek(SeekFrom::Start(*address))?;
-        let bt = ChunkBTreeV1::read_le_args(reader, (d,));
-
+        let bt: ChunkBTreeV1 = read_metadata_args(file, *address, (d,)).await?;
         println!("dataset is chunked. reading B-Tree:\n{:#?}", bt);
 
-        let it = BTreeIter::new(reader, bt.unwrap());
+        let leaves = collect_btree_leaves_args(file, bt).await?;
 
         let mut last = 0;
         let mut n = 0;
 
-        for c in it {
-            if c.is_err() {
-                println!("btree err: {:?}", c);
-            }
-
-            let c = c.unwrap();
+        for c in &leaves {
             let delta = c.key.offsets[0] - last;
             if c.key.offsets[0] > 0 {
                 assert_eq!(delta, dimension_sizes[0] as u64)

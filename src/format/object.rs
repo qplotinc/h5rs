@@ -1,12 +1,13 @@
 #![allow(dead_code)]
 use modular_bitfield::prelude::*;
-use std::io::{Read, Seek, SeekFrom};
 
 use binrw::{BinRead, BinResult, NullString};
 
 use crate::{
     Dataset, Group,
+    error::H5Result,
     format::metadata::{GroupBTreeV1, LocalHeap},
+    object_store::{ObjectStoreFile, read_and_parse_args, read_metadata},
 };
 
 /// Object Header
@@ -67,15 +68,18 @@ impl DataObjectHeader {
         })
     }
 
-    pub fn load_continuation_messages<R: Read + Seek>(&mut self, reader: &mut R) -> BinResult<()> {
+    pub async fn load_continuation_messages(
+        &mut self,
+        file: &ObjectStoreFile,
+    ) -> H5Result<()> {
         let mut new_messages = vec![];
         for m in self.messages.iter() {
             let InnerMessage::ObjectHeaderContinuation(m) = &m.inner else {
                 continue;
             };
 
-            reader.seek(SeekFrom::Start(m.offset))?;
-            let msg = MessageList::read_le_args(reader, (m.length as u32,))?;
+            let msg: MessageList =
+                read_and_parse_args(file, m.offset, m.length, (m.length as u32,)).await?;
             new_messages.extend(msg.messages);
         }
 
@@ -83,25 +87,27 @@ impl DataObjectHeader {
         Ok(())
     }
 
-    pub fn to_group<R: Read + Seek>(&self, name: String, r: &mut R) -> Option<BinResult<Group>> {
+    pub async fn to_group(
+        &self,
+        name: String,
+        file: &ObjectStoreFile,
+    ) -> Option<H5Result<Group>> {
         let Some(stm) = self.symbol_table_message() else {
             return None;
         };
 
-        let r: BinResult<Group> = (|| {
-            r.seek(SeekFrom::Start(stm.btree_address))?;
-            let btree = GroupBTreeV1::read_le(r)?;
-
-            r.seek(SeekFrom::Start(stm.local_heap_address))?;
-            let local_heap = LocalHeap::read_le(r)?;
-            let loaded_local_heap = local_heap.load(r)?;
+        let r: H5Result<Group> = async {
+            let btree: GroupBTreeV1 = read_metadata(file, stm.btree_address).await?;
+            let local_heap: LocalHeap = read_metadata(file, stm.local_heap_address).await?;
+            let loaded_local_heap = local_heap.load(file).await?;
 
             Ok(Group {
                 name,
                 btree,
                 loaded_local_heap,
             })
-        })();
+        }
+        .await;
 
         Some(r)
     }

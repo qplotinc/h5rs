@@ -6,7 +6,7 @@ The HDF5 library required to read and write the format has the following drawbac
 - Relies on POSIX I/O
 - Synchronous, single threaded API - can't easily take advantage of multiple threads when decompressing chunks
 
-This makes it challenging to consume HDF5 from the browser. [h5wasm](https://github.com/usnistgov/h5wasm) compiles the HDF5 library to WASM, and mounts URLs to an Emscripten Filesystem with a [special library](https://github.com/bmaranville/lazyFileLRU)
+This makes it challenging to consume HDF5 from the browser. [h5wasm](https://github.com/usnistgov/h5wasm) compiles the HDF5 library to WASM, and mounts URLs to an Emscripten Filesystem with a [special library](https://github.com/bmaranville/lazyFileLRU). This can only be used inside Web workers.
 
 h5rs is attempt to have a pure Rust HDF5 reader, suitable for visualization tools that access HDF5 files via object storage. Rust, and the incredible [binrw](https://crates.io/crates/binrw) crate now seem to make it feasible to have a small-ish library that lets us efficiently read HDF5 in the library.
 

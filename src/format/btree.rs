@@ -1,157 +1,73 @@
 #![allow(dead_code)]
-use std::{
-    cell::RefCell,
-    io::{Read, Seek, SeekFrom},
-    rc::Rc,
-};
 
-use binrw::{BinRead, BinResult};
+use binrw::BinRead;
 
-#[derive(Debug)]
-pub struct BTreeIter<'a, T, B> {
-    reader: &'a mut T,
-    stack: Vec<(B, usize)>,
-}
-
-impl<'a, T, B> BTreeIter<'a, T, B> {
-    pub fn new(reader: &'a mut T, tree: B) -> BTreeIter<'a, T, B> {
-        BTreeIter {
-            reader,
-            stack: vec![(tree, 0)],
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct BTreeIter2<B, R> {
-    reader: Rc<RefCell<R>>,
-    stack: Vec<(B, usize)>,
-}
-
-impl<B, R> BTreeIter2<B, R> {
-    pub fn new(reader: Rc<RefCell<R>>, tree: B) -> BTreeIter2<B, R> {
-        BTreeIter2 {
-            reader,
-            stack: vec![(tree, 0)],
-        }
-    }
-}
+use crate::error::H5Result;
+use crate::object_store::{ObjectStoreFile, read_metadata, read_metadata_args};
 
 pub trait HasPointer {
     fn child_pointer(&self) -> u64;
 }
-pub trait BTree {
+
+pub trait BTree: Sized {
     type Leaf: Clone + HasPointer;
-    type Args;
+    type Args: Clone;
     fn children(&self) -> &[Self::Leaf];
     fn args(&self) -> Self::Args;
     fn node_level(&self) -> u8;
 }
-enum IterState {
-    Done,
-    NodeDone,
-    InnerNode,
-    LeafNode,
-}
-impl<'a, T: Read + Seek, B: BTree<Args = A> + BinRead<Args<'a> = A>, A> Iterator
-    for BTreeIter<'a, T, B>
+
+/// Collect all leaf entries from a B-tree via async DFS (no args variant).
+pub async fn collect_btree_leaves<B>(
+    file: &ObjectStoreFile,
+    root: B,
+) -> H5Result<Vec<B::Leaf>>
+where
+    B: BTree<Args = ()> + Clone + for<'a> BinRead<Args<'a> = ()>,
 {
-    type Item = BinResult<<B as BTree>::Leaf>;
+    let mut result = Vec::new();
+    let mut stack = vec![root];
 
-    fn next(&mut self) -> Option<Self::Item> {
-        use IterState::*;
-
-        loop {
-            let state = match self.stack.last() {
-                None => IterState::Done,
-                Some((node, pos)) if node.children().len() == *pos => NodeDone,
-                Some((node, _)) if node.node_level() > 0 => InnerNode,
-                Some((_, _)) => LeafNode,
-            };
-
-            match state {
-                IterState::Done => return None,
-                IterState::NodeDone => {
-                    let _ = self.stack.pop();
-                }
-                IterState::InnerNode => {
-                    // Need to expand down a level.
-                    let child_node = {
-                        let Some((node, pos)) = self.stack.last_mut() else {
-                            unreachable!();
-                        };
-                        self.reader
-                            .seek(SeekFrom::Start(node.children()[*pos].child_pointer()))
-                            .ok()?;
-                        *pos += 1;
-
-                        let args = node.args();
-                        B::read_le_args(self.reader, args).ok()?
-                    };
-
-                    self.stack.push((child_node, 0));
-                }
-                IterState::LeafNode => {
-                    let Some((node, pos)) = self.stack.last_mut() else {
-                        unreachable!();
-                    };
-                    let leaf = node.children()[*pos].clone();
-                    *pos += 1;
-                    return Some(Ok(leaf));
-                }
-            };
+    while let Some(node) = stack.pop() {
+        if node.node_level() == 0 {
+            result.extend(node.children().iter().cloned());
+        } else {
+            // Push children in reverse order to preserve left-to-right traversal
+            for child in node.children().iter().rev() {
+                let child_node: B = read_metadata(file, child.child_pointer()).await?;
+                stack.push(child_node);
+            }
         }
     }
+
+    Ok(result)
 }
 
-impl<'a, R: Read + Seek, B: BTree<Args = A> + BinRead<Args<'a> = A>, A> Iterator
-    for BTreeIter2<B, R>
+/// Collect all leaf entries from a B-tree via async DFS (with args variant).
+pub async fn collect_btree_leaves_args<B, A>(
+    file: &ObjectStoreFile,
+    root: B,
+) -> H5Result<Vec<B::Leaf>>
+where
+    A: Clone,
+    B: BTree<Args = A> + Clone + for<'a> BinRead<Args<'a> = A>,
 {
-    type Item = BinResult<<B as BTree>::Leaf>;
+    let mut result = Vec::new();
+    let mut stack = vec![root];
 
-    fn next(&mut self) -> Option<Self::Item> {
-        use IterState::*;
-
-        loop {
-            let state = match self.stack.last() {
-                None => IterState::Done,
-                Some((node, pos)) if node.children().len() == *pos => NodeDone,
-                Some((node, _)) if node.node_level() > 0 => InnerNode,
-                Some((_, _)) => LeafNode,
-            };
-
-            match state {
-                IterState::Done => return None,
-                IterState::NodeDone => {
-                    let _ = self.stack.pop();
-                }
-                IterState::InnerNode => {
-                    // Need to expand down a level.
-                    let child_node = {
-                        let Some((node, pos)) = self.stack.last_mut() else {
-                            unreachable!();
-                        };
-                        self.reader
-                            .borrow_mut()
-                            .seek(SeekFrom::Start(node.children()[*pos].child_pointer()))
-                            .ok()?;
-                        *pos += 1;
-
-                        let args = node.args();
-                        B::read_le_args(&mut *self.reader.borrow_mut(), args).ok()?
-                    };
-
-                    self.stack.push((child_node, 0));
-                }
-                IterState::LeafNode => {
-                    let Some((node, pos)) = self.stack.last_mut() else {
-                        unreachable!();
-                    };
-                    let leaf = node.children()[*pos].clone();
-                    *pos += 1;
-                    return Some(Ok(leaf));
-                }
-            };
+    while let Some(node) = stack.pop() {
+        if node.node_level() == 0 {
+            result.extend(node.children().iter().cloned());
+        } else {
+            let args = node.args();
+            // Push children in reverse order to preserve left-to-right traversal
+            for child in node.children().iter().rev() {
+                let child_node: B =
+                    read_metadata_args(file, child.child_pointer(), args.clone()).await?;
+                stack.push(child_node);
+            }
         }
     }
+
+    Ok(result)
 }

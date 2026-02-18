@@ -1,25 +1,22 @@
 #![allow(dead_code)]
-use std::{
-    cell::RefCell,
-    io::{Read, Seek, SeekFrom},
-    rc::Rc,
-};
 
-use binrw::{BinRead, BinResult};
-
+use crate::error::H5Result;
 use crate::format::{
-    btree::{BTreeIter, BTreeIter2},
+    btree::{collect_btree_leaves, collect_btree_leaves_args},
     metadata::{
         ChunkBTreeV1, ChunkPointerV1, GroupBTreeV1, GroupPointerV1, GroupSymbolTableNode,
         LoadedLocalHeap, SuperblockV0, SymbolTableEntry,
     },
     object::{
         DataLayoutChunked, DataLayoutInner, DataLayoutMessage, DataLayoutV3, DataObjectHeader,
-        DataspaceMessage, DatatypeMessage, FilterMessage, LayoutInner,
+        DataspaceMessage, DatatypeMessage, FilterMessage, FilterType, LayoutInner,
     },
 };
+use crate::object_store::{ObjectStoreFile, fetch_exact, read_metadata, read_metadata_args};
 
+pub mod error;
 pub(crate) mod format;
+pub(crate) mod object_store;
 
 struct File {
     superblock: SuperblockV0,
@@ -27,20 +24,14 @@ struct File {
 }
 
 impl File {
-    pub fn open<R: Read + Seek>(reader: &mut R) -> BinResult<File> {
-        let sb = SuperblockV0::read_le(reader)?;
+    pub async fn open(file: &ObjectStoreFile) -> H5Result<File> {
+        let sb: SuperblockV0 = read_metadata(file, 0).await?;
 
-        reader.seek(SeekFrom::Start(
-            sb.root_group_symbol_table_entry.object_header_address,
-        ))?;
-        let root_group = DataObjectHeader::read_le(reader);
-        let mut root_group = root_group.unwrap();
-        root_group.load_continuation_messages(reader).unwrap();
+        let mut root_group: DataObjectHeader =
+            read_metadata(file, sb.root_group_symbol_table_entry.object_header_address).await?;
+        root_group.load_continuation_messages(file).await?;
 
-        let rg = root_group
-            .to_group("/".to_string(), reader)
-            .unwrap()
-            .unwrap();
+        let rg = root_group.to_group("/".to_string(), file).await.unwrap()?;
 
         Ok(File {
             superblock: sb,
@@ -55,8 +46,11 @@ struct Object {
 }
 
 impl Object {
-    pub fn to_group<R: Read + Seek>(&self, r: &mut R) -> BinResult<Option<Group>> {
-        self.header.to_group(self.name.clone(), r).transpose()
+    pub async fn to_group(&self, file: &ObjectStoreFile) -> H5Result<Option<Group>> {
+        match self.header.to_group(self.name.clone(), file).await {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -66,28 +60,17 @@ struct Group {
     loaded_local_heap: LoadedLocalHeap,
 }
 
-struct GroupObjectIter<'a, R> {
-    group: &'a Group,
-    reader: RefCell<R>,
-    btree_iter: BTreeIter2<GroupBTreeV1, R>,
-    current_symbol_table: Option<GroupSymbolTableNode>,
-    symbol_table_pos: usize,
-}
-
 impl Group {
-    fn object_refs<R: Read + Seek>(
+    async fn object_refs(
         &self,
-        reader: &mut R,
-    ) -> BinResult<Vec<(String, SymbolTableEntry)>> {
-        let it: BinResult<Vec<GroupPointerV1>> =
-            BTreeIter::new(reader, self.btree.clone()).collect();
-
-        let ptrs = it?;
+        file: &ObjectStoreFile,
+    ) -> H5Result<Vec<(String, SymbolTableEntry)>> {
+        let ptrs: Vec<GroupPointerV1> = collect_btree_leaves(file, self.btree.clone()).await?;
 
         let mut res = vec![];
 
         for p in ptrs {
-            let st = self.load_symbol_table(&p, reader)?;
+            let st = self.load_symbol_table(&p, file).await?;
             for e in &st.entries {
                 let name = self.loaded_local_heap.get_string(e.link_name_offset)?;
                 let e = e.clone();
@@ -98,55 +81,38 @@ impl Group {
         Ok(res)
     }
 
-    fn load_symbol_table<R: Read + Seek>(
+    async fn load_symbol_table(
         &self,
         ptr: &GroupPointerV1,
-        reader: &mut R,
-    ) -> BinResult<GroupSymbolTableNode> {
-        reader.seek(SeekFrom::Start(ptr.child_pointer))?;
-        GroupSymbolTableNode::read_le(reader)
+        file: &ObjectStoreFile,
+    ) -> H5Result<GroupSymbolTableNode> {
+        read_metadata(file, ptr.child_pointer).await
     }
 
-    fn iter_symbol_table<R: Read + Seek>(
-        &self,
-        symbol_table: &GroupSymbolTableNode,
-        reader: &mut R,
-    ) -> impl Iterator<Item = BinResult<Object>> {
-        symbol_table
-            .entries
-            .iter()
-            .map(|e| self.load_object(e, reader))
-    }
-
-    fn load_object<R: Read + Seek>(
+    async fn load_object(
         &self,
         ptr: &SymbolTableEntry,
-        reader: &mut R,
-    ) -> BinResult<Object> {
+        file: &ObjectStoreFile,
+    ) -> H5Result<Object> {
         let name = self.loaded_local_heap.get_string(ptr.link_name_offset)?;
-
-        reader.seek(SeekFrom::Start(ptr.object_header_address))?;
-        let header = DataObjectHeader::read_le(reader)?;
+        let header: DataObjectHeader = read_metadata(file, ptr.object_header_address).await?;
 
         Ok(Object { name, header })
     }
 
-    // FIXME: this visits every symbol table entry in the group --
-    // we will want more efficient object finding if there are a lot of objects in groups.
-    fn find_obj<R: Read + Seek>(
+    async fn find_obj(
         &self,
         name: impl AsRef<str>,
-        reader: &mut R,
-    ) -> BinResult<Option<Object>> {
-        let r = self.object_refs(reader)?;
+        file: &ObjectStoreFile,
+    ) -> H5Result<Option<Object>> {
+        let r = self.object_refs(file).await?;
         let Some((name, ste)) = r.iter().find(|(n, _)| n == name.as_ref()) else {
             println!("didn't find object: {}", name.as_ref());
             return Ok(None);
         };
 
-        reader.seek(SeekFrom::Start(ste.object_header_address))?;
-        let mut header = DataObjectHeader::read_le(reader)?;
-        header.load_continuation_messages(reader)?;
+        let mut header: DataObjectHeader = read_metadata(file, ste.object_header_address).await?;
+        header.load_continuation_messages(file).await?;
 
         Ok(Some(Object {
             name: name.clone(),
@@ -198,129 +164,198 @@ struct ChunkedDataset {
 }
 
 impl ChunkedDataset {
-    // FIXME - support different datatypes
-    pub fn read_chunk_simple<R: Read + Seek>(
+    pub async fn read_chunk_simple(
         &self,
         c: &ChunkPointerV1,
-        reader: &mut R,
-    ) -> BinResult<Vec<u32>> {
-        let n: u32 = self.chunks_layout.dimension_sizes.iter().product();
+        file: &ObjectStoreFile,
+    ) -> H5Result<Vec<u32>> {
+        let byte_count: usize = self
+            .chunks_layout
+            .dimension_sizes
+            .iter()
+            .map(|&d| d as usize)
+            .product();
 
-        let mut result = vec![0u32; n as usize];
+        assert_eq!(byte_count, c.key.chunk_size as usize);
+
+        let bytes = fetch_exact(file, c.child_pointer, byte_count as u64).await?;
+
+        let mut result = vec![0u32; byte_count / 4];
         let read_target: &mut [u8] = bytemuck::cast_slice_mut(&mut result);
-        // make sure we got the right size to read
-        assert_eq!(read_target.len(), c.key.chunk_size as usize);
-
-        reader.seek(SeekFrom::Start(c.child_pointer))?;
-        reader.read_exact(read_target)?;
+        read_target.copy_from_slice(&bytes);
 
         Ok(result)
     }
 
-    // FIXME - support different datatypes
-    pub fn read_chunk_filter<R: Read + Seek>(
+    pub async fn read_chunk_filter(
         &self,
         c: &ChunkPointerV1,
-        reader: &mut R,
-    ) -> BinResult<Vec<u32>> {
-        let n: u32 = self.chunks_layout.dimension_sizes.iter().product();
-        let mut result = vec![0u32; n as usize];
+        file: &ObjectStoreFile,
+    ) -> H5Result<Vec<u32>> {
+        use std::io::Read;
 
-        let read_target: &mut [u8] = bytemuck::cast_slice_mut(&mut result);
-        // make sure we got the right size to read
-        assert_eq!(read_target.len(), c.key.chunk_size as usize);
+        let uncompressed_bytes: usize = self
+            .chunks_layout
+            .dimension_sizes
+            .iter()
+            .map(|&d| d as usize)
+            .product();
 
-        // FIXME - just hardcoding gzip + shuffle right now.
-        reader.seek(SeekFrom::Start(c.child_pointer))?;
-        let mut gz = flate2::read::GzDecoder::new(reader);
+        let compressed = fetch_exact(file, c.child_pointer, c.key.chunk_size as u64).await?;
 
-        gz.read_exact(read_target)?;
+        // Inflate
+        let mut data = Vec::with_capacity(uncompressed_bytes);
+        let mut decoder = flate2::read::ZlibDecoder::new(&compressed[..]);
+        decoder
+            .read_to_end(&mut data)
+            .map_err(|e| binrw::Error::Custom {
+                pos: c.child_pointer,
+                err: Box::new(e),
+            })?;
 
-        // now de-shuffle somehow.
+        assert_eq!(data.len(), uncompressed_bytes);
 
+        // Un-shuffle
+        if self.filter.as_ref().is_some_and(|f| {
+            f.filters
+                .iter()
+                .any(|fd| matches!(fd.filter_type, FilterType::Shuffle))
+        }) {
+            let element_size = *self.chunks_layout.dimension_sizes.last().unwrap() as usize;
+            let num_elements = uncompressed_bytes / element_size;
+            let mut unshuffled = vec![0u8; uncompressed_bytes];
+
+            for i in 0..num_elements {
+                for b in 0..element_size {
+                    unshuffled[i * element_size + b] = data[b * num_elements + i];
+                }
+            }
+            data = unshuffled;
+        }
+
+        let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
         Ok(result)
     }
 
-    pub fn iter_chunks<R: Read + Seek>(
-        &self,
-        reader: Rc<RefCell<R>>,
-    ) -> BinResult<impl Iterator<Item = BinResult<ChunkPointerV1>>> {
-        reader
-            .borrow_mut()
-            .seek(SeekFrom::Start(self.chunks_layout.address))?;
-        let btree = ChunkBTreeV1::read_le_args(
-            &mut *reader.borrow_mut(),
+    pub async fn collect_chunks(&self, file: &ObjectStoreFile) -> H5Result<Vec<ChunkPointerV1>> {
+        let btree: ChunkBTreeV1 = read_metadata_args(
+            file,
+            self.chunks_layout.address,
             (self.dataspace.dimensionality,),
-        )?;
+        )
+        .await?;
 
-        Ok(BTreeIter2::new(reader, btree))
+        collect_btree_leaves_args(file, btree).await
     }
 }
 
 #[cfg(test)]
 mod test {
 
-    use std::{cell::RefCell, rc::Rc};
-
-    use binrw::BinResult;
     use hdf5::Result;
     use ndarray::s;
+    use object_store::{local::LocalFileSystem, path::Path};
+
+    use crate::error::H5Result;
+    use crate::object_store::ObjectStoreFile;
 
     const MOL_INFO_FILE: &str = "datasets/frozen_pbmc_donor_c_molecule_info.h5";
     const MATRIX_FILE: &str = "datasets/gene_bc_matrix.h5";
 
-    fn load_ds() -> Result<()> {
-        let f = hdf5::File::open(MOL_INFO_FILE).unwrap();
-        let ds = f.dataset("/umi").unwrap();
+    fn test_file(path: &str) -> ObjectStoreFile {
+        let cwd = std::env::current_dir().unwrap();
+        let store = LocalFileSystem::new_with_prefix(&cwd).unwrap();
+        ObjectStoreFile::new(Box::new(store), Path::from(path))
+    }
 
-        let v = ds.read_slice_1d::<u32, _>(s![..16])?;
+    #[tokio::test]
+    async fn cmp1() -> H5Result<()> {
+        // Read first chunk via hdf5 crate (ground truth)
+        let hf = hdf5::File::open(MOL_INFO_FILE).unwrap();
+        let hds = hf.dataset("/umi").unwrap();
+        let expected = hds.read_slice_1d::<u32, _>(s![..16384]).unwrap();
 
-        println!("{v:?}");
+        // Read first chunk via h5rs
+        let file = test_file(MOL_INFO_FILE);
+        let f = super::File::open(&file).await?;
+
+        let obj = f.root_group.find_obj("umi", &file).await?;
+        let o = obj.unwrap();
+        let ds = o.header.to_dataset("umi".to_string()).unwrap();
+        let cds = ds.chunked().unwrap();
+
+        let chunks = cds.collect_chunks(&file).await?;
+        let chunk_ptr = &chunks[0];
+
+        let chunk = cds.read_chunk_simple(chunk_ptr, &file).await?;
+
+        assert_eq!(chunk.len(), expected.len());
+        assert_eq!(&chunk[..], expected.as_slice().unwrap());
+        println!(
+            "SUCCESS: first chunk of umi ({} values) matches hdf5 reference",
+            chunk.len()
+        );
+
         Ok(())
     }
 
-    #[test]
-    fn cmp1() -> BinResult<()> {
-        load_ds().unwrap();
+    #[tokio::test]
+    async fn filters() -> H5Result<()> {
+        let file = test_file(MATRIX_FILE);
+        let f = super::File::open(&file).await?;
 
-        let mut rdr = std::io::BufReader::new(std::fs::File::open(MOL_INFO_FILE).unwrap());
-        let f = super::File::open(&mut rdr)?;
-
-        let obj = f.root_group.find_obj("umi", &mut rdr)?;
-
+        let obj = f.root_group.find_obj("matrix", &file).await?;
         let o = obj.unwrap();
-        let ds = o.header.to_dataset("adf".to_string()).unwrap();
+        let g = o.to_group(&file).await?.unwrap();
+
+        let data = g.find_obj("data", &file).await?.unwrap();
+
+        println!("data matrix: {:#?}", data.header);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_filtered_data() -> H5Result<()> {
+        // Read via hdf5 crate (ground truth)
+        let hf = hdf5::File::open(MATRIX_FILE).unwrap();
+        let hds = hf.dataset("matrix/data").unwrap();
+        let expected = hds.read_raw::<i32>().unwrap();
+
+        // Read via h5rs
+        let file = test_file(MATRIX_FILE);
+        let f = super::File::open(&file).await?;
+
+        let matrix_obj = f.root_group.find_obj("matrix", &file).await?.unwrap();
+        let matrix_group = matrix_obj.to_group(&file).await?.unwrap();
+        let data_obj = matrix_group.find_obj("data", &file).await?.unwrap();
+
+        let ds = data_obj.header.to_dataset("data".to_string()).unwrap();
+        println!("filter: {:#?}", ds.filter);
+        println!("dataspace: {:#?}", ds.dataspace);
+        println!("datatype: {:#?}", ds.datatype);
 
         let cds = ds.chunked().unwrap();
 
-        let rc = Rc::new(RefCell::new(rdr));
-        let chunk = cds
-            .iter_chunks(rc.clone())
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
+        let chunks = cds.collect_chunks(&file).await?;
 
-        let chunk = cds
-            .read_chunk_simple(&chunk, &mut *rc.borrow_mut())
-            .unwrap();
-        println!("my chunk: {:?}", &chunk[..16]);
+        println!("num chunks: {}", chunks.len());
 
-        Ok(())
-    }
+        let mut all_data: Vec<i32> = Vec::new();
+        for chunk in &chunks {
+            let data = cds.read_chunk_filter(chunk, &file).await?;
+            let data_i32: Vec<i32> = data.iter().map(|&v| v as i32).collect();
+            all_data.extend_from_slice(&data_i32);
+        }
 
-    #[test]
-    fn filters() -> BinResult<()> {
-        let mut rdr = std::io::BufReader::new(std::fs::File::open(MATRIX_FILE).unwrap());
-        let f = super::File::open(&mut rdr)?;
+        all_data.truncate(expected.len());
 
-        let obj = f.root_group.find_obj("matrix", &mut rdr)?;
-        let o = obj.unwrap();
-        let g = o.to_group(&mut rdr)?.unwrap();
+        assert_eq!(all_data.len(), expected.len(), "length mismatch");
+        assert_eq!(&all_data[..], &expected[..], "data mismatch");
 
-        let data = g.find_obj("data", &mut rdr)?.unwrap();
-
-        println!("data matrix: {:#?}", data.header);
+        println!(
+            "SUCCESS: read {} values matching hdf5 reference",
+            all_data.len()
+        );
         Ok(())
     }
 }

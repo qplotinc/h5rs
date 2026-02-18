@@ -1,9 +1,11 @@
 #![allow(dead_code)]
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::Cursor;
 
 use binrw::{BinRead, BinResult, NullString};
 
+use crate::error::H5Result;
 use crate::format::btree::*;
+use crate::object_store::{ObjectStoreFile, fetch_exact};
 
 #[derive(BinRead, Debug)]
 #[br(magic = b"\x89HDF\r\n\x1a\n")]
@@ -91,7 +93,7 @@ impl HasPointer for GroupPointerV1 {
     }
 }
 
-#[derive(BinRead, Debug)]
+#[derive(BinRead, Debug, Clone)]
 #[br(magic = b"TREE")]
 #[br(import(dim: u8))]
 pub struct ChunkBTreeV1 {
@@ -199,14 +201,12 @@ pub struct LocalHeap {
 }
 
 impl LocalHeap {
-    pub fn load<R: Read + Seek>(&self, reader: &mut R) -> BinResult<LoadedLocalHeap> {
-        reader.seek(SeekFrom::Start(self.data_segment_address))?;
-        let mut data = vec![0u8; self.data_segment_size as usize];
-        reader.read_exact(&mut data[..])?;
+    pub async fn load(&self, file: &ObjectStoreFile) -> H5Result<LoadedLocalHeap> {
+        let data = fetch_exact(file, self.data_segment_address, self.data_segment_size).await?;
 
         Ok(LoadedLocalHeap {
             header: self.clone(),
-            data,
+            data: data.to_vec(),
         })
     }
 }
