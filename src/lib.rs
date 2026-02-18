@@ -8,14 +8,17 @@ use crate::format::{
         LoadedLocalHeap, SuperblockV0, SymbolTableEntry,
     },
     object::{
-        DataLayoutChunked, DataLayoutInner, DataLayoutMessage, DataLayoutV3, DataObjectHeader,
-        DataspaceMessage, DatatypeMessage, FilterMessage, FilterType, LayoutInner,
+        AttributeMessage, DataLayoutChunked, DataLayoutInner, DataLayoutMessage, DataLayoutV3,
+        DataObjectHeader, DataspaceMessage, DatatypeMessage, FilterMessage, FilterType,
+        LayoutInner,
     },
 };
+use crate::h5type::H5Type;
 use crate::object_store::{ObjectStoreFile, fetch_exact, read_metadata, read_metadata_args};
 
 pub mod error;
 pub(crate) mod format;
+pub mod h5type;
 pub(crate) mod object_store;
 
 struct File {
@@ -58,6 +61,7 @@ struct Group {
     name: String,
     btree: GroupBTreeV1,
     loaded_local_heap: LoadedLocalHeap,
+    pub attributes: Vec<AttributeMessage>,
 }
 
 impl Group {
@@ -127,6 +131,7 @@ struct Dataset {
     datatype: DatatypeMessage,
     layout: DataLayoutMessage,
     filter: Option<FilterMessage>,
+    pub attributes: Vec<AttributeMessage>,
 }
 
 impl Dataset {
@@ -164,11 +169,13 @@ struct ChunkedDataset {
 }
 
 impl ChunkedDataset {
-    pub async fn read_chunk_simple(
+    pub async fn read_chunk_simple<T: H5Type>(
         &self,
         c: &ChunkPointerV1,
         file: &ObjectStoreFile,
-    ) -> H5Result<Vec<u32>> {
+    ) -> H5Result<Vec<T>> {
+        T::check_dtype(&self.datatype);
+
         let byte_count: usize = self
             .chunks_layout
             .dimension_sizes
@@ -180,19 +187,22 @@ impl ChunkedDataset {
 
         let bytes = fetch_exact(file, c.child_pointer, byte_count as u64).await?;
 
-        let mut result = vec![0u32; byte_count / 4];
+        let elem_size = std::mem::size_of::<T>();
+        let mut result = vec![T::zeroed(); byte_count / elem_size];
         let read_target: &mut [u8] = bytemuck::cast_slice_mut(&mut result);
         read_target.copy_from_slice(&bytes);
 
         Ok(result)
     }
 
-    pub async fn read_chunk_filter(
+    pub async fn read_chunk_filter<T: H5Type>(
         &self,
         c: &ChunkPointerV1,
         file: &ObjectStoreFile,
-    ) -> H5Result<Vec<u32>> {
+    ) -> H5Result<Vec<T>> {
         use std::io::Read;
+
+        T::check_dtype(&self.datatype);
 
         let uncompressed_bytes: usize = self
             .chunks_layout
@@ -233,7 +243,7 @@ impl ChunkedDataset {
             data = unshuffled;
         }
 
-        let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        let result: Vec<T> = bytemuck::cast_slice(&data).to_vec();
         Ok(result)
     }
 
@@ -251,13 +261,14 @@ impl ChunkedDataset {
 
 #[cfg(test)]
 mod test {
+    use std::fmt::Debug;
 
-    use hdf5::Result;
-    use ndarray::s;
     use object_store::{local::LocalFileSystem, path::Path};
 
     use crate::error::H5Result;
-    use crate::object_store::ObjectStoreFile;
+    use crate::format::object::{AttributeMessage, DataObjectHeader, TypeDescriptor};
+    use crate::h5type::H5Type;
+    use crate::object_store::{ObjectStoreFile, read_metadata};
 
     const MOL_INFO_FILE: &str = "datasets/frozen_pbmc_donor_c_molecule_info.h5";
     const MATRIX_FILE: &str = "datasets/gene_bc_matrix.h5";
@@ -268,94 +279,203 @@ mod test {
         ObjectStoreFile::new(Box::new(store), Path::from(path))
     }
 
-    #[tokio::test]
-    async fn cmp1() -> H5Result<()> {
-        // Read first chunk via hdf5 crate (ground truth)
-        let hf = hdf5::File::open(MOL_INFO_FILE).unwrap();
-        let hds = hf.dataset("/umi").unwrap();
-        let expected = hds.read_slice_1d::<u32, _>(s![..16384]).unwrap();
+    /// Read all chunks of a dataset via h5rs and compare byte-for-byte
+    /// against the hdf5 C library (gold standard).
+    async fn compare_typed<T>(
+        cds: &super::ChunkedDataset,
+        hdf5_ds: &hdf5::Dataset,
+        path: &str,
+        file: &ObjectStoreFile,
+    ) -> H5Result<()>
+    where
+        T: H5Type + hdf5::H5Type + PartialEq + Debug,
+    {
+        let expected: Vec<T> = hdf5_ds.read_raw::<T>().unwrap();
+        let chunks = cds.collect_chunks(file).await?;
 
-        // Read first chunk via h5rs
-        let file = test_file(MOL_INFO_FILE);
-        let f = super::File::open(&file).await?;
-
-        let obj = f.root_group.find_obj("umi", &file).await?;
-        let o = obj.unwrap();
-        let ds = o.header.to_dataset("umi".to_string()).unwrap();
-        let cds = ds.chunked().unwrap();
-
-        let chunks = cds.collect_chunks(&file).await?;
-        let chunk_ptr = &chunks[0];
-
-        let chunk = cds.read_chunk_simple(chunk_ptr, &file).await?;
-
-        assert_eq!(chunk.len(), expected.len());
-        assert_eq!(&chunk[..], expected.as_slice().unwrap());
-        println!(
-            "SUCCESS: first chunk of umi ({} values) matches hdf5 reference",
-            chunk.len()
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn filters() -> H5Result<()> {
-        let file = test_file(MATRIX_FILE);
-        let f = super::File::open(&file).await?;
-
-        let obj = f.root_group.find_obj("matrix", &file).await?;
-        let o = obj.unwrap();
-        let g = o.to_group(&file).await?.unwrap();
-
-        let data = g.find_obj("data", &file).await?.unwrap();
-
-        println!("data matrix: {:#?}", data.header);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_filtered_data() -> H5Result<()> {
-        // Read via hdf5 crate (ground truth)
-        let hf = hdf5::File::open(MATRIX_FILE).unwrap();
-        let hds = hf.dataset("matrix/data").unwrap();
-        let expected = hds.read_raw::<i32>().unwrap();
-
-        // Read via h5rs
-        let file = test_file(MATRIX_FILE);
-        let f = super::File::open(&file).await?;
-
-        let matrix_obj = f.root_group.find_obj("matrix", &file).await?.unwrap();
-        let matrix_group = matrix_obj.to_group(&file).await?.unwrap();
-        let data_obj = matrix_group.find_obj("data", &file).await?.unwrap();
-
-        let ds = data_obj.header.to_dataset("data".to_string()).unwrap();
-        println!("filter: {:#?}", ds.filter);
-        println!("dataspace: {:#?}", ds.dataspace);
-        println!("datatype: {:#?}", ds.datatype);
-
-        let cds = ds.chunked().unwrap();
-
-        let chunks = cds.collect_chunks(&file).await?;
-
-        println!("num chunks: {}", chunks.len());
-
-        let mut all_data: Vec<i32> = Vec::new();
+        let has_filters = cds.filter.is_some();
+        let mut all_data: Vec<T> = Vec::new();
         for chunk in &chunks {
-            let data = cds.read_chunk_filter(chunk, &file).await?;
-            let data_i32: Vec<i32> = data.iter().map(|&v| v as i32).collect();
-            all_data.extend_from_slice(&data_i32);
+            let data: Vec<T> = if has_filters {
+                cds.read_chunk_filter(chunk, file).await?
+            } else {
+                cds.read_chunk_simple(chunk, file).await?
+            };
+            all_data.extend_from_slice(&data);
         }
 
+        // Last chunk may have padding beyond the actual dataset size
         all_data.truncate(expected.len());
 
-        assert_eq!(all_data.len(), expected.len(), "length mismatch");
-        assert_eq!(&all_data[..], &expected[..], "data mismatch");
-
+        assert_eq!(all_data.len(), expected.len(), "{path}: length mismatch");
+        assert_eq!(&all_data[..], &expected[..], "{path}: data mismatch");
         println!(
-            "SUCCESS: read {} values matching hdf5 reference",
-            all_data.len()
+            "  OK {path} ({} values, {} chunks)",
+            expected.len(),
+            chunks.len()
         );
+
         Ok(())
+    }
+
+    /// Dispatch to the correct typed comparison based on the HDF5 datatype.
+    async fn compare_dataset(
+        cds: &super::ChunkedDataset,
+        hdf5_ds: &hdf5::Dataset,
+        path: &str,
+        file: &ObjectStoreFile,
+    ) -> H5Result<()> {
+        match &cds.datatype.type_desc {
+            TypeDescriptor::FixedPoint(fp) => match (fp.signed(), fp.size()) {
+                (0, 1) => compare_typed::<u8>(cds, hdf5_ds, path, file).await,
+                (0, 2) => compare_typed::<u16>(cds, hdf5_ds, path, file).await,
+                (0, 4) => compare_typed::<u32>(cds, hdf5_ds, path, file).await,
+                (0, 8) => compare_typed::<u64>(cds, hdf5_ds, path, file).await,
+                (1, 1) => compare_typed::<i8>(cds, hdf5_ds, path, file).await,
+                (1, 2) => compare_typed::<i16>(cds, hdf5_ds, path, file).await,
+                (1, 4) => compare_typed::<i32>(cds, hdf5_ds, path, file).await,
+                (1, 8) => compare_typed::<i64>(cds, hdf5_ds, path, file).await,
+                (s, sz) => panic!("{path}: unsupported FixedPoint signed={s} size={sz}"),
+            },
+            TypeDescriptor::FloatingPoint(fp) => match fp.size() {
+                4 => compare_typed::<f32>(cds, hdf5_ds, path, file).await,
+                8 => compare_typed::<f64>(cds, hdf5_ds, path, file).await,
+                sz => panic!("{path}: unsupported FloatingPoint size={sz}"),
+            },
+            other => {
+                println!("  SKIP {path}: unsupported type {other:?}");
+                Ok(())
+            }
+        }
+    }
+
+    /// Walk a group's children, collecting chunked datasets and sub-groups.
+    async fn collect_from_group(
+        group: &super::Group,
+        path: &str,
+        file: &ObjectStoreFile,
+        hf: &hdf5::File,
+        datasets: &mut Vec<(String, super::ChunkedDataset)>,
+        group_stack: &mut Vec<(super::Group, String)>,
+    ) -> H5Result<()> {
+        let refs = group.object_refs(file).await?;
+        for (name, ste) in &refs {
+            let child_path = if path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{path}/{name}")
+            };
+
+            let mut header: DataObjectHeader =
+                read_metadata(file, ste.object_header_address).await?;
+            header.load_continuation_messages(file).await?;
+
+            if let Some(result) = header.to_group(name.clone(), file).await {
+                let g = result?;
+                let hdf5_group = hf.group(&child_path).unwrap();
+                compare_attrs(&g.attributes, &hdf5_group, &child_path);
+                group_stack.push((g, child_path));
+            } else if let Some(ds) = header.to_dataset(name.clone()) {
+                let hdf5_ds = hf.dataset(&child_path).unwrap();
+                compare_attrs(&ds.attributes, &hdf5_ds, &child_path);
+                if let Some(cds) = ds.chunked() {
+                    datasets.push((child_path, cds));
+                } else {
+                    println!("  SKIP {child_path}: non-chunked layout");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn compare_attr_typed<T>(attr: &AttributeMessage, hdf5_attr: &hdf5::Attribute, path: &str)
+    where
+        T: H5Type + hdf5::H5Type + PartialEq + Debug,
+    {
+        let ours: Vec<T> = attr.read::<T>();
+        let expected: Vec<T> = hdf5_attr.read_raw::<T>().unwrap();
+        assert_eq!(ours, expected, "{path}@{}: data mismatch", attr.name());
+        println!("  OK {path}@{} ({} values)", attr.name(), ours.len());
+    }
+
+    fn compare_attr_untyped(attr: &AttributeMessage, hdf5_attr: &hdf5::Attribute, path: &str) {
+        match &attr.datatype.type_desc {
+            TypeDescriptor::FixedPoint(fp) => match (fp.signed(), fp.size()) {
+                (0, 1) => compare_attr_typed::<u8>(attr, hdf5_attr, path),
+                (0, 2) => compare_attr_typed::<u16>(attr, hdf5_attr, path),
+                (0, 4) => compare_attr_typed::<u32>(attr, hdf5_attr, path),
+                (0, 8) => compare_attr_typed::<u64>(attr, hdf5_attr, path),
+                (1, 1) => compare_attr_typed::<i8>(attr, hdf5_attr, path),
+                (1, 2) => compare_attr_typed::<i16>(attr, hdf5_attr, path),
+                (1, 4) => compare_attr_typed::<i32>(attr, hdf5_attr, path),
+                (1, 8) => compare_attr_typed::<i64>(attr, hdf5_attr, path),
+                (s, sz) => println!(
+                    "  SKIP {path}@{}: unsupported FixedPoint signed={s} size={sz}",
+                    attr.name()
+                ),
+            },
+            TypeDescriptor::FloatingPoint(fp) => match fp.size() {
+                4 => compare_attr_typed::<f32>(attr, hdf5_attr, path),
+                8 => compare_attr_typed::<f64>(attr, hdf5_attr, path),
+                sz => println!(
+                    "  SKIP {path}@{}: unsupported FloatingPoint size={sz}",
+                    attr.name()
+                ),
+            },
+            other => {
+                println!(
+                    "  SKIP {path}@{}: unsupported attr type {other:?}",
+                    attr.name()
+                );
+            }
+        }
+    }
+
+    fn compare_attrs(attrs: &[AttributeMessage], hdf5_loc: &hdf5::Location, path: &str) {
+        for attr in attrs {
+            let name = attr.name();
+            let hdf5_attr = hdf5_loc.attr(&name).unwrap();
+            compare_attr_untyped(attr, &hdf5_attr, path);
+        }
+    }
+
+    /// Open an HDF5 file, walk all groups, and compare every chunked
+    /// dataset against the hdf5 C library.
+    async fn compare_file(path: &str) -> H5Result<()> {
+        let file = test_file(path);
+        let f = super::File::open(&file).await?;
+        let hf = hdf5::File::open(path).unwrap();
+
+        // Compare root group attributes
+        compare_attrs(&f.root_group.attributes, &hf, "/");
+
+        let mut datasets: Vec<(String, super::ChunkedDataset)> = vec![];
+        let mut group_stack: Vec<(super::Group, String)> = vec![];
+
+        collect_from_group(&f.root_group, "/", &file, &hf, &mut datasets, &mut group_stack)
+            .await?;
+        while let Some((group, gpath)) = group_stack.pop() {
+            collect_from_group(&group, &gpath, &file, &hf, &mut datasets, &mut group_stack)
+                .await?;
+        }
+
+        println!("{path}: found {} chunked datasets", datasets.len());
+
+        for (ds_path, cds) in &datasets {
+            let hdf5_ds = hf.dataset(ds_path).unwrap();
+            compare_dataset(cds, &hdf5_ds, ds_path, &file).await?;
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mol_info_file() -> H5Result<()> {
+        compare_file(MOL_INFO_FILE).await
+    }
+
+    #[tokio::test]
+    async fn matrix_file() -> H5Result<()> {
+        compare_file(MATRIX_FILE).await
     }
 }

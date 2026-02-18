@@ -21,6 +21,8 @@ The `cmp1` test also requires the `hdf5` dev-dependency, which expects `../hdf5-
 
 **h5rs** is a pure Rust, read-only HDF5 file parser targeting HTTP/object-storage access patterns. It uses `binrw` for declarative binary parsing instead of the C HDF5 library.
 
+The official HDF5 file format spec is available at: https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html
+
 ### Module layout
 
 - **`src/lib.rs`** — High-level API: `File`, `Group`, `Object`, `Dataset`, `ChunkedDataset`. This is the user-facing layer that composes format primitives into an ergonomic read path.
@@ -43,4 +45,4 @@ File::open → SuperblockV0 → root DataObjectHeader → Group (btree + local h
 - `bytemuck::cast_slice_mut` for zero-copy reinterpretation of byte buffers as typed arrays.
 - Chunk decompression uses `flate2` with the `zlib-rs` feature (pure Rust zlib). Currently hardcoded for gzip+shuffle filter pipeline.
 - Only HDF5 v1 B-trees and Superblock v0 are implemented. No v2 B-tree or superblock v2 support yet.
-- Reader is passed around as `&mut R: Read + Seek` or `Rc<RefCell<R>>` when shared ownership is needed (e.g., chunk iteration).
+- Reader is passed around as `ObjectStoreFile` which is thin wrapper around the ObjectStore trait (object_store crate).

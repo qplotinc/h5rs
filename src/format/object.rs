@@ -68,6 +68,16 @@ impl DataObjectHeader {
         })
     }
 
+    pub fn attribute_messages(&self) -> Vec<&AttributeMessage> {
+        self.messages
+            .iter()
+            .filter_map(|x| match &x.inner {
+                InnerMessage::Attribute(a) => Some(a),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub async fn load_continuation_messages(
         &mut self,
         file: &ObjectStoreFile,
@@ -96,6 +106,8 @@ impl DataObjectHeader {
             return None;
         };
 
+        let attributes = self.attribute_messages().into_iter().cloned().collect();
+
         let r: H5Result<Group> = async {
             let btree: GroupBTreeV1 = read_metadata(file, stm.btree_address).await?;
             let local_heap: LocalHeap = read_metadata(file, stm.local_heap_address).await?;
@@ -105,6 +117,7 @@ impl DataObjectHeader {
                 name,
                 btree,
                 loaded_local_heap,
+                attributes,
             })
         }
         .await;
@@ -131,6 +144,7 @@ impl DataObjectHeader {
             datatype: datatype.clone(),
             layout: layout.clone(),
             filter: self.filter_message().cloned(),
+            attributes: self.attribute_messages().into_iter().cloned().collect(),
         })
     }
 }
@@ -252,9 +266,9 @@ pub struct FixedPointDescriptor {
     byte_order: B1,
     low_padding: B1,
     high_padding: B1,
-    signed: B1,
+    pub signed: B1,
     rest: B20,
-    size: u32,
+    pub size: u32,
     bit_offset: u16,
     bit_precision: u16,
 }
@@ -271,7 +285,7 @@ pub struct FloatingPointDescriptor {
     reserved: B2,
     sign_location: u8,
     rest: u8,
-    size: u32,
+    pub size: u32,
     bit_offset: u16,
     bit_precision: u16,
     exponent_location: u8,
@@ -281,6 +295,31 @@ pub struct FloatingPointDescriptor {
     exponent_bias: u32,
 }
 
+impl DatatypeMessage {
+    pub fn element_size(&self) -> usize {
+        match &self.type_desc {
+            TypeDescriptor::FixedPoint(fp) => fp.size() as usize,
+            TypeDescriptor::FloatingPoint(fp) => fp.size() as usize,
+            TypeDescriptor::String(s) => s.size() as usize,
+            // VL references on disk: uint32 length + uint64 heap addr + uint32 heap index = 16
+            TypeDescriptor::Variable(_) => 16,
+            TypeDescriptor::UnimplementedTypeClass => {
+                panic!("element_size not supported for unimplemented type class")
+            }
+        }
+    }
+}
+
+impl DataspaceMessage {
+    pub fn num_elements(&self) -> usize {
+        if self.dimensionality == 0 {
+            1
+        } else {
+            self.dimension.iter().map(|&d| d as usize).product()
+        }
+    }
+}
+
 #[bitfield(bits = 56)]
 #[derive(BinRead, Debug, Clone)]
 #[br(map = Self::from_bytes)]
@@ -288,7 +327,7 @@ pub struct StringDescriptor {
     padding: B4,
     character_set: B4,
     rest: B16,
-    size: u32,
+    pub size: u32,
 }
 
 #[bitfield(bits = 24)]
@@ -444,8 +483,8 @@ pub struct FilterDescription {
     pub client_data: Vec<u32>,
 }
 
-#[derive(BinRead, Debug)]
-struct AttributeMessage {
+#[derive(BinRead, Debug, Clone)]
+pub struct AttributeMessage {
     #[br(assert(version == 1))]
     version: u8,
     flags: u8,
@@ -454,14 +493,24 @@ struct AttributeMessage {
     dataspace_size: u16,
 
     #[br(align_after = 8)]
-    name: NullString,
+    pub name: NullString,
     #[br(pad_size_to = datatype_size.next_multiple_of(8))]
-    datatype: DatatypeMessage,
+    pub datatype: DatatypeMessage,
     #[br(pad_size_to = dataspace_size.next_multiple_of(8))]
-    dataspace: DataspaceMessage,
-    // TODO - need to calculate this based on dataspace and datatype
-    //#[br(count = data_size)]
-    //message: Vec<u8>,
+    pub dataspace: DataspaceMessage,
+    #[br(count = datatype.element_size() * dataspace.num_elements())]
+    pub data: Vec<u8>,
+}
+
+impl AttributeMessage {
+    pub fn name(&self) -> String {
+        self.name.to_string()
+    }
+
+    pub fn read<T: crate::h5type::H5Type>(&self) -> Vec<T> {
+        T::check_dtype(&self.datatype);
+        bytemuck::cast_slice(&self.data).to_vec()
+    }
 }
 
 #[derive(BinRead, Debug)]
