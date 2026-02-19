@@ -324,8 +324,8 @@ impl DataspaceMessage {
 #[derive(BinRead, Debug, Clone)]
 #[br(map = Self::from_bytes)]
 pub struct StringDescriptor {
-    padding: B4,
-    character_set: B4,
+    pub padding: B4,
+    pub character_set: B4,
     rest: B16,
     pub size: u32,
 }
@@ -510,6 +510,36 @@ impl AttributeMessage {
     pub fn read<T: crate::h5type::H5Type>(&self) -> Vec<T> {
         T::check_dtype(&self.datatype);
         bytemuck::cast_slice(&self.data).to_vec()
+    }
+
+    pub fn read_strings(&self) -> Vec<String> {
+        let TypeDescriptor::String(ref sd) = self.datatype.type_desc else {
+            panic!("read_strings called on non-string type: {:?}", self.datatype.type_desc);
+        };
+        let elem_size = sd.size() as usize;
+        let num = self.dataspace.num_elements();
+        self.data
+            .chunks(elem_size)
+            .take(num)
+            .map(|chunk| {
+                let trimmed = match sd.padding() {
+                    // Null-terminated: data up to first null
+                    0 => &chunk[..chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len())],
+                    // Null-padded: strip trailing nulls
+                    1 => {
+                        let end = chunk.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+                        &chunk[..end]
+                    }
+                    // Space-padded: strip trailing spaces
+                    2 => {
+                        let end = chunk.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
+                        &chunk[..end]
+                    }
+                    p => panic!("unknown string padding type: {p}"),
+                };
+                String::from_utf8_lossy(trimmed).into_owned()
+            })
+            .collect()
     }
 }
 
