@@ -18,9 +18,117 @@ pub(crate) mod chunked;
 pub mod error;
 pub(crate) mod format;
 pub mod h5type;
-pub(crate) mod object_store;
+pub mod object_store;
 
 pub use chunked::{ChunkedDataset, NdArray};
+
+/// Metadata about a dataset found during HDF5 tree walking.
+#[derive(Debug, Clone)]
+pub struct DatasetInfo {
+    /// Full internal path, e.g. "/group1/dataset".
+    pub path: String,
+    /// Dataset shape (dimensions).
+    pub shape: Vec<u64>,
+    /// Chunk shape, if the dataset is chunked.
+    pub chunk_shape: Option<Vec<u64>>,
+    /// (is_float, is_signed, byte_size) for the scalar type.
+    pub dtype_info: (bool, bool, usize),
+    /// Names of HDF5 filters applied (e.g. "Deflate", "Shuffle").
+    pub filters: Vec<String>,
+}
+
+/// Walk an HDF5 file's group tree and return info about all datasets.
+pub async fn list_datasets(
+    file: &crate::object_store::ObjectStoreFile,
+) -> error::H5Result<Vec<DatasetInfo>> {
+    let f = File::open(file).await?;
+    let mut results = Vec::new();
+    let mut stack: Vec<(Group, String)> = vec![(f.root_group, String::new())];
+
+    while let Some((group, prefix)) = stack.pop() {
+        let refs = group.object_refs(file).await?;
+        for (name, ste) in &refs {
+            let child_path = if prefix.is_empty() {
+                format!("/{name}")
+            } else {
+                format!("{prefix}/{name}")
+            };
+
+            let mut header: DataObjectHeader =
+                read_metadata(file, ste.object_header_address).await?;
+            header.load_continuation_messages(file).await?;
+
+            if let Some(result) = header.to_group(name.clone(), file).await {
+                let g = result?;
+                stack.push((g, child_path));
+            } else if let Some(ds) = header.to_dataset(name.clone()) {
+                let ndim = ds.dataspace.dimensionality as usize;
+                let shape = ds.dataspace.dimension[..ndim].to_vec();
+                let (chunk_shape, filters) = if let Some(cds) = ds.chunked() {
+                    (Some(cds.chunk_shape()), cds.filter_names())
+                } else {
+                    (None, vec![])
+                };
+                let dtype_info = match &ds.datatype.type_desc {
+                    crate::format::object::TypeDescriptor::FloatingPoint(fp) => {
+                        (true, true, fp.size() as usize)
+                    }
+                    crate::format::object::TypeDescriptor::FixedPoint(fp) => {
+                        (false, fp.signed() != 0, fp.size() as usize)
+                    }
+                    _ => (false, false, ds.datatype.element_size()),
+                };
+                results.push(DatasetInfo {
+                    path: child_path,
+                    shape,
+                    chunk_shape,
+                    dtype_info,
+                    filters,
+                });
+            }
+        }
+    }
+
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(results)
+}
+
+/// Open an HDF5 file and navigate to a chunked dataset by internal path.
+///
+/// `internal_path` is a slice of group/dataset names, e.g. `["group1", "dataset"]`.
+/// Returns `None` if the path does not exist or the target is not a chunked dataset.
+pub async fn open_chunked_dataset(
+    file: &crate::object_store::ObjectStoreFile,
+    internal_path: &[&str],
+) -> error::H5Result<Option<ChunkedDataset>> {
+    if internal_path.is_empty() {
+        return Ok(None);
+    }
+
+    let f = File::open(file).await?;
+    let mut current_group = f.root_group;
+
+    // Navigate through groups (all but last segment)
+    for &segment in &internal_path[..internal_path.len() - 1] {
+        match current_group.find_obj(segment, file).await? {
+            Some(obj) => match obj.to_group(file).await? {
+                Some(g) => current_group = g,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        }
+    }
+
+    // Last segment should be a dataset
+    let dataset_name = internal_path.last().unwrap();
+    match current_group.find_obj(*dataset_name, file).await? {
+        Some(obj) => match obj.header.to_dataset(dataset_name.to_string()) {
+            Some(ds) => Ok(ds.chunked()),
+            None => Ok(None),
+        },
+        None => Ok(None),
+    }
+}
 
 struct File {
     superblock: SuperblockV0,

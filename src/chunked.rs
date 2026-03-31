@@ -129,6 +129,47 @@ pub struct ChunkedDataset {
 }
 
 impl ChunkedDataset {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns human-readable names of the HDF5 filters (compression, shuffle, etc.)
+    pub fn filter_names(&self) -> Vec<String> {
+        match &self.filter {
+            Some(fm) => fm
+                .filters
+                .iter()
+                .map(|fd| format!("{:?}", fd.filter_type))
+                .collect(),
+            None => vec![],
+        }
+    }
+
+    pub fn ndim(&self) -> usize {
+        self.dataspace.dimensionality as usize
+    }
+
+    pub fn shape(&self) -> Vec<u64> {
+        self.dataspace.dimension[..self.ndim()].to_vec()
+    }
+
+    pub fn chunk_shape(&self) -> Vec<u64> {
+        self.chunks_layout.dimension_sizes[..self.ndim()]
+            .iter()
+            .map(|&d| d as u64)
+            .collect()
+    }
+
+    /// Returns (is_float, is_signed, byte_size) for the dataset's scalar type.
+    pub fn dtype_info(&self) -> (bool, bool, usize) {
+        use crate::format::object::TypeDescriptor;
+        match &self.datatype.type_desc {
+            TypeDescriptor::FloatingPoint(fp) => (true, true, fp.size() as usize),
+            TypeDescriptor::FixedPoint(fp) => (false, fp.signed() != 0, fp.size() as usize),
+            _ => (false, false, 0),
+        }
+    }
+
     /// Decode a chunk and copy the specified sub-region directly into `dst`.
     /// For unfiltered data, copies directly from the fetched bytes into `dst`
     /// with no intermediate buffer.
