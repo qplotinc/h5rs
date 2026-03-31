@@ -18,8 +18,17 @@ inherits = "release"
 opt-level = 3
 debug = true
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 hdf5 = { path = "../hdf5-rust/hdf5" }
 ndarray = "0.15"
 tempfile = "3.25.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+chrono = { version = "0.4", features = ["wasmbind"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-test = "0.3"
+js-sys = "0.3"
+async-trait = "0.1"

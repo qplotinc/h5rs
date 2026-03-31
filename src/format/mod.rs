@@ -4,7 +4,7 @@ pub mod object;
 
 #[cfg(test)]
 mod tests {
-    use object_store::{local::LocalFileSystem, path::Path};
+    use object_store::path::Path;
 
     use crate::{
         Dataset,
@@ -21,12 +21,21 @@ mod tests {
     };
 
     fn test_file(path: &str) -> ObjectStoreFile {
-        let cwd = std::env::current_dir().unwrap();
-        let store = LocalFileSystem::new_with_prefix(&cwd).unwrap();
-        ObjectStoreFile::new(Box::new(store), Path::from(path))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use object_store::local::LocalFileSystem;
+            let cwd = std::env::current_dir().unwrap();
+            let store = LocalFileSystem::new_with_prefix(&cwd).unwrap();
+            ObjectStoreFile::new(Box::new(store), Path::from(path))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let store = crate::node_store::NodeFileSystem::cwd();
+            ObjectStoreFile::new(Box::new(store), Path::from(path))
+        }
     }
 
-    #[tokio::test]
+    #[crate::async_test]
     async fn basic() -> H5Result<()> {
         let file = test_file("datasets/gene_bc_matrix.h5");
 

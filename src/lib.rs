@@ -18,6 +18,8 @@ pub(crate) mod chunked;
 pub mod error;
 pub(crate) mod format;
 pub mod h5type;
+#[cfg(all(test, target_arch = "wasm32"))]
+mod node_store;
 pub mod object_store;
 
 pub use chunked::{ChunkedDataset, NdArray};
@@ -269,24 +271,39 @@ mod test {
 
     use std::fmt::Debug;
 
-    use object_store::{local::LocalFileSystem, path::Path};
+    use object_store::path::Path;
 
     use crate::error::H5Result;
-    use crate::format::object::{AttributeMessage, DataObjectHeader, TypeDescriptor};
     use crate::h5type::H5Type;
-    use crate::object_store::{ObjectStoreFile, read_metadata};
+    use crate::object_store::ObjectStoreFile;
 
     const MOL_INFO_FILE: &str = "datasets/frozen_pbmc_donor_c_molecule_info.h5";
     const MATRIX_FILE: &str = "datasets/gene_bc_matrix.h5";
 
     fn test_file(path: &str) -> ObjectStoreFile {
-        let cwd = std::env::current_dir().unwrap();
-        let store = LocalFileSystem::new_with_prefix(&cwd).unwrap();
-        ObjectStoreFile::new(Box::new(store), Path::from(path))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use object_store::local::LocalFileSystem;
+            let cwd = std::env::current_dir().unwrap();
+            let store = LocalFileSystem::new_with_prefix(&cwd).unwrap();
+            ObjectStoreFile::new(Box::new(store), Path::from(path))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let store = crate::node_store::NodeFileSystem::cwd();
+            ObjectStoreFile::new(Box::new(store), Path::from(path))
+        }
     }
+
+    // ---- hdf5-dependent tests (native only) ----
+    #[cfg(not(target_arch = "wasm32"))]
+    use crate::format::object::{AttributeMessage, DataObjectHeader, TypeDescriptor};
+    #[cfg(not(target_arch = "wasm32"))]
+    use crate::object_store::read_metadata;
 
     /// Read all chunks of a dataset via h5rs and compare byte-for-byte
     /// against the hdf5 C library (gold standard).
+    #[cfg(not(target_arch = "wasm32"))]
     async fn compare_typed<T>(
         cds: &super::ChunkedDataset,
         hdf5_ds: &hdf5::Dataset,
@@ -311,6 +328,7 @@ mod test {
     }
 
     /// Dispatch to the correct typed comparison based on the HDF5 datatype.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn compare_dataset(
         cds: &super::ChunkedDataset,
         hdf5_ds: &hdf5::Dataset,
@@ -342,6 +360,7 @@ mod test {
     }
 
     /// Walk a group's children, collecting chunked datasets and sub-groups.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn collect_from_group(
         group: &super::Group,
         path: &str,
@@ -380,6 +399,7 @@ mod test {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn compare_attr_typed<T>(attr: &AttributeMessage, hdf5_attr: &hdf5::Attribute, path: &str)
     where
         T: H5Type + hdf5::H5Type + PartialEq + Debug,
@@ -391,6 +411,7 @@ mod test {
     }
 
     /// FixedAscii<N> requires a compile-time size, so we dispatch via macro.
+    #[cfg(not(target_arch = "wasm32"))]
     macro_rules! compare_fixed_strings {
         ($attr:expr, $hdf5_attr:expr, $path:expr, $( $n:literal ),*) => {
             match $attr.datatype.element_size() {
@@ -421,6 +442,7 @@ mod test {
         };
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn compare_attr_strings(attr: &AttributeMessage, hdf5_attr: &hdf5::Attribute, path: &str) {
         compare_fixed_strings!(
             attr, hdf5_attr, path, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
@@ -428,6 +450,7 @@ mod test {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn compare_attr_untyped(attr: &AttributeMessage, hdf5_attr: &hdf5::Attribute, path: &str) {
         match &attr.datatype.type_desc {
             TypeDescriptor::FixedPoint(fp) => match (fp.signed(), fp.size()) {
@@ -462,6 +485,7 @@ mod test {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn compare_attrs(attrs: &[AttributeMessage], hdf5_loc: &hdf5::Location, path: &str) {
         for attr in attrs {
             let name = attr.name();
@@ -472,6 +496,7 @@ mod test {
 
     /// Open an HDF5 file, walk all groups, and compare every chunked
     /// dataset against the hdf5 C library.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn compare_file(path: &str) -> H5Result<()> {
         let file = test_file(path);
         let f = super::File::open(&file).await?;
@@ -506,11 +531,13 @@ mod test {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn mol_info_file() -> H5Result<()> {
         compare_file(MOL_INFO_FILE).await
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn matrix_file() -> H5Result<()> {
         compare_file(MATRIX_FILE).await
@@ -562,7 +589,7 @@ mod test {
         assert_eq!(&result.data[..], expected, "range {range:?}: data mismatch");
     }
 
-    #[tokio::test]
+    #[crate::async_test]
     async fn read_range_basic() -> H5Result<()> {
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
@@ -596,7 +623,7 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
+    #[crate::async_test]
     async fn read_range_chunk_boundaries() -> H5Result<()> {
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
@@ -638,7 +665,7 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
+    #[crate::async_test]
     async fn read_range_various_sizes() -> H5Result<()> {
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
@@ -681,7 +708,7 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
+    #[crate::async_test]
     async fn read_range_clamping() -> H5Result<()> {
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
@@ -705,7 +732,7 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
+    #[crate::async_test]
     async fn read_range_u32_dataset() -> H5Result<()> {
         // Test read_range on a u32 dataset (barcode_corrected_reads)
         let file = test_file(MOL_INFO_FILE);
@@ -753,7 +780,7 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
+    #[crate::async_test]
     async fn read_range_u64_dataset() -> H5Result<()> {
         // Test read_range on a u64 dataset (barcode) to cover larger element types
         let file = test_file(MOL_INFO_FILE);
@@ -787,7 +814,7 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
+    #[crate::async_test]
     async fn read_range_chunk_skip_count() -> H5Result<()> {
         // Verify that read_range skips chunks outside the selection.
         // We do this by comparing the number of chunks that overlap with
@@ -825,14 +852,16 @@ mod test {
         Ok(())
     }
 
-    // ---- Performance comparison tests ----
+    // ---- Performance comparison tests (native only) ----
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn median(times: &[std::time::Duration]) -> std::time::Duration {
         let mut sorted: Vec<_> = times.to_vec();
         sorted.sort();
         sorted[sorted.len() / 2]
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn fmt_duration(d: std::time::Duration) -> String {
         let ms = d.as_secs_f64() * 1000.0;
         if ms >= 1000.0 {
@@ -842,12 +871,14 @@ mod test {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     struct BenchResult {
         name: String,
         h5rs_times: Vec<std::time::Duration>,
         hdf5_times: Vec<std::time::Duration>,
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     impl BenchResult {
         fn print(&self) {
             let h = median(&self.h5rs_times);
@@ -862,6 +893,7 @@ mod test {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     #[ignore] // Run with: cargo test perf -- --ignored --nocapture
     #[allow(unused)]
@@ -1282,7 +1314,7 @@ mod test {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod roundtrip {
     use std::fmt::Debug;
 
@@ -1550,3 +1582,18 @@ mod roundtrip {
         RoundtripTest::new().shape(&[1]).chunk(&[1])
     );
 }
+
+/// Conditional async test attribute: `#[tokio::test]` on native, `#[wasm_bindgen_test]` on WASM.
+///
+/// Usage:
+/// ```ignore
+/// #[crate::async_test]
+/// async fn my_test() { ... }
+/// ```
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(unused_imports)]
+pub(crate) use tokio::test as async_test;
+
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) use wasm_bindgen_test::wasm_bindgen_test as async_test;
+
