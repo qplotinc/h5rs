@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use modular_bitfield::prelude::*;
 
 use binrw::{BinRead, BinResult, NullString};
 
@@ -236,12 +235,17 @@ pub struct DatatypeMessage {
     pub type_desc: TypeDescriptor,
 }
 
-#[bitfield]
 #[derive(BinRead, Debug, Clone)]
-#[br(map = Self::from_bytes)]
-pub struct VersionAndClass {
-    pub class: B4,
-    pub version: B4,
+#[br(map = VersionAndClass)]
+pub struct VersionAndClass(u8);
+
+impl VersionAndClass {
+    pub fn class(&self) -> u8 {
+        self.0 & 0x0F
+    }
+    pub fn version(&self) -> u8 {
+        self.0 >> 4
+    }
 }
 
 #[derive(BinRead, Debug, Clone)]
@@ -259,40 +263,27 @@ pub enum TypeDescriptor {
     UnimplementedTypeClass,
 }
 
-#[bitfield(bits = 88)]
 #[derive(BinRead, Debug, Clone)]
-#[br(map = Self::from_bytes)]
-pub struct FixedPointDescriptor {
-    byte_order: B1,
-    low_padding: B1,
-    high_padding: B1,
-    pub signed: B1,
-    rest: B20,
-    pub size: u32,
-    bit_offset: u16,
-    bit_precision: u16,
+#[br(map = FixedPointDescriptor)]
+pub struct FixedPointDescriptor([u8; 11]);
+
+impl FixedPointDescriptor {
+    pub fn signed(&self) -> u8 {
+        (self.0[0] >> 3) & 1
+    }
+    pub fn size(&self) -> u32 {
+        u32::from_le_bytes([self.0[3], self.0[4], self.0[5], self.0[6]])
+    }
 }
 
-#[bitfield(bits = 152)]
 #[derive(BinRead, Debug, Clone)]
-#[br(map = Self::from_bytes)]
-pub struct FloatingPointDescriptor {
-    byte_order: B1,
-    low_padding: B1,
-    high_padding: B1,
-    internal_padding: B1,
-    mantissa_normalization: B2,
-    reserved: B2,
-    sign_location: u8,
-    rest: u8,
-    pub size: u32,
-    bit_offset: u16,
-    bit_precision: u16,
-    exponent_location: u8,
-    exponent_size: u8,
-    mantissa_location: u8,
-    mantissa_size: u8,
-    exponent_bias: u32,
+#[br(map = FloatingPointDescriptor)]
+pub struct FloatingPointDescriptor([u8; 19]);
+
+impl FloatingPointDescriptor {
+    pub fn size(&self) -> u32 {
+        u32::from_le_bytes([self.0[3], self.0[4], self.0[5], self.0[6]])
+    }
 }
 
 impl DatatypeMessage {
@@ -320,25 +311,25 @@ impl DataspaceMessage {
     }
 }
 
-#[bitfield(bits = 56)]
 #[derive(BinRead, Debug, Clone)]
-#[br(map = Self::from_bytes)]
-pub struct StringDescriptor {
-    pub padding: B4,
-    pub character_set: B4,
-    rest: B16,
-    pub size: u32,
+#[br(map = StringDescriptor)]
+pub struct StringDescriptor([u8; 7]);
+
+impl StringDescriptor {
+    pub fn padding(&self) -> u8 {
+        self.0[0] & 0x0F
+    }
+    pub fn character_set(&self) -> u8 {
+        self.0[0] >> 4
+    }
+    pub fn size(&self) -> u32 {
+        u32::from_le_bytes([self.0[3], self.0[4], self.0[5], self.0[6]])
+    }
 }
 
-#[bitfield(bits = 24)]
 #[derive(BinRead, Debug, Clone)]
-#[br(map = Self::from_bytes)]
-pub struct VariableLengthDescriptorBits {
-    variable_type: B4,
-    padding: B4,
-    character_set: B4,
-    rest: B12,
-}
+#[br(map = VariableLengthDescriptorBits)]
+pub struct VariableLengthDescriptorBits([u8; 3]);
 
 #[derive(BinRead, Debug, Clone)]
 pub struct VariableLengthDescriptor {

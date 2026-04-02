@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use binrw::BinRead;
 use bytes::Bytes;
-use futures::stream::BoxStream;
+use futures_core::stream::BoxStream;
 use object_store::{GetOptions, GetRange, ObjectMeta};
 use object_store::{ObjectStore, path::Path};
 

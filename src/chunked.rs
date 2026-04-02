@@ -2,8 +2,6 @@
 
 use std::ops::Range;
 
-use arrayvec::ArrayVec;
-
 use crate::error::H5Result;
 use crate::format::{
     btree::collect_btree_leaves_args,
@@ -25,13 +23,10 @@ pub struct NdArray<T> {
     pub shape: Vec<usize>,
 }
 
-type Dims = ArrayVec<usize, 4>;
-
 /// Compute row-major strides for a given shape.
-fn row_major_strides(shape: &[usize]) -> Dims {
+fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     let ndim = shape.len();
-    let mut strides = Dims::new();
-    strides.try_extend_from_slice(&[1; 4][..ndim]).unwrap();
+    let mut strides = vec![1; ndim];
     for d in (0..ndim.saturating_sub(1)).rev() {
         strides[d] = strides[d + 1] * shape[d + 1];
     }
@@ -99,8 +94,8 @@ fn copy_region_inner(
         let len = size[dim] * elem_size;
         dst[db..db + len].copy_from_slice(&src[sb..sb + len]);
     } else {
-        let mut src_off: Dims = Dims::try_from(src_offset).unwrap();
-        let mut dst_off: Dims = Dims::try_from(dst_offset).unwrap();
+        let mut src_off: Vec<usize> = src_offset.to_vec();
+        let mut dst_off: Vec<usize> = dst_offset.to_vec();
         for i in 0..size[dim] {
             src_off[dim] = src_offset[dim] + i;
             dst_off[dim] = dst_offset[dim] + i;
@@ -346,13 +341,13 @@ impl ChunkedDataset {
                 continue;
             }
 
-            let chunk_local_start: Dims = (0..ndim)
+            let chunk_local_start: Vec<usize> = (0..ndim)
                 .map(|d| (global_start[d] - chunk_offset[d]) as usize)
                 .collect();
-            let output_start: Dims = (0..ndim)
+            let output_start: Vec<usize> = (0..ndim)
                 .map(|d| (global_start[d] - sel[d].start) as usize)
                 .collect();
-            let inter_size: Dims = (0..ndim)
+            let inter_size: Vec<usize> = (0..ndim)
                 .map(|d| (global_end[d] - global_start[d]) as usize)
                 .collect();
 
