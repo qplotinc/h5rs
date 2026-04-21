@@ -1581,6 +1581,81 @@ mod roundtrip {
         u32,
         RoundtripTest::new().shape(&[1]).chunk(&[1])
     );
+
+    #[tokio::test]
+    async fn fuzz_roundtrip() -> H5Result<()> {
+        const SEED: u64 = 1235;
+        const ITERS: usize = 20;
+
+        struct Prng(u64);
+        impl Prng {
+            fn next(&mut self) -> u64 {
+                // Knuth multiplicative LCG
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn range(&mut self, lo: u64, hi: u64) -> u64 {
+                lo + self.next() % (hi - lo)
+            }
+            fn bool(&mut self) -> bool {
+                self.next() % 2 == 0
+            }
+        }
+
+        let mut rng = Prng(SEED);
+
+        for i in 0..ITERS {
+            let ndim = rng.range(1, 4) as usize; // 1, 2, or 3
+            let max_dim: u64 = match ndim {
+                1 => 5000,
+                2 => 500,
+                _ => 50,
+            };
+            let shape: Vec<usize> = (0..ndim)
+                .map(|_| rng.range(1, max_dim + 1) as usize)
+                .collect();
+            let chunk: Vec<usize> = shape
+                .iter()
+                .map(|&d| rng.range(1, d as u64 + 1) as usize)
+                .collect();
+            let deflate = if rng.bool() { Some(1u8) } else { None };
+            let shuffle = deflate.is_some() && rng.bool();
+            let type_idx = rng.range(0, 10) as usize;
+
+            let mut cfg = RoundtripTest::new().shape(&shape).chunk(&chunk);
+            if let Some(level) = deflate {
+                cfg = cfg.deflate(level);
+            }
+            if shuffle {
+                cfg = cfg.shuffle();
+            }
+
+            let result = match type_idx {
+                0 => cfg.run::<u8>().await,
+                1 => cfg.run::<u16>().await,
+                2 => cfg.run::<u32>().await,
+                3 => cfg.run::<u64>().await,
+                4 => cfg.run::<i8>().await,
+                5 => cfg.run::<i16>().await,
+                6 => cfg.run::<i32>().await,
+                7 => cfg.run::<i64>().await,
+                8 => cfg.run::<f32>().await,
+                _ => cfg.run::<f64>().await,
+            };
+
+            result.unwrap_or_else(|e| {
+                panic!(
+                    "iter {i}: shape={shape:?} chunk={chunk:?} deflate={deflate:?} \
+                     shuffle={shuffle} type_idx={type_idx}: {e}"
+                )
+            });
+        }
+
+        Ok(())
+    }
 }
 
 /// Conditional async test attribute: `#[tokio::test]` on native, `#[wasm_bindgen_test]` on WASM.
@@ -1596,4 +1671,3 @@ pub(crate) use tokio::test as async_test;
 
 #[cfg(all(test, target_arch = "wasm32"))]
 pub(crate) use wasm_bindgen_test::wasm_bindgen_test as async_test;
-
