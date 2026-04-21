@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use binrw::BinRead;
 
 use crate::error::H5Result;

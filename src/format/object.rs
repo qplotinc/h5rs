@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(unused_assignments)] // binrw `#[br(import {...})]` triggers this in derived impls
 
 use binrw::{BinRead, BinResult, NullString};
 
@@ -12,6 +12,7 @@ use crate::{
 /// Object Header
 /// https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#sec_fmt4_dataobject
 #[derive(BinRead, Debug)]
+#[allow(dead_code)]
 pub struct DataObjectHeader {
     version: u8,
     #[br(pad_before = 1)]
@@ -96,11 +97,7 @@ impl DataObjectHeader {
         Ok(())
     }
 
-    pub async fn to_group(
-        &self,
-        name: String,
-        file: &ObjectStoreFile,
-    ) -> Option<H5Result<Group>> {
+    pub async fn to_group(&self, file: &ObjectStoreFile) -> Option<H5Result<Group>> {
         let Some(stm) = self.symbol_table_message() else {
             return None;
         };
@@ -113,7 +110,6 @@ impl DataObjectHeader {
             let loaded_local_heap = local_heap.load(file).await?;
 
             Ok(Group {
-                name,
                 btree,
                 loaded_local_heap,
                 attributes,
@@ -169,6 +165,7 @@ fn parse_header_list(object_header_size: u32) -> BinResult<Vec<HeaderMessage>> {
 }
 
 #[derive(BinRead, Debug)]
+#[allow(dead_code)]
 struct HeaderMessage {
     message_type: u16,
     data_size: u16,
@@ -180,6 +177,7 @@ struct HeaderMessage {
 }
 
 #[derive(BinRead, Debug)]
+#[allow(dead_code)]
 #[br(import { ty: u16, data_size: u16 })]
 enum InnerMessage {
     #[br(pre_assert(ty == 0))]
@@ -210,6 +208,7 @@ enum InnerMessage {
 struct NilMessage {}
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct DataspaceMessage {
     #[br(assert(version == 1))]
     pub version: u8,
@@ -329,15 +328,18 @@ impl StringDescriptor {
 
 #[derive(BinRead, Debug, Clone)]
 #[br(map = VariableLengthDescriptorBits)]
+#[allow(dead_code)]
 pub struct VariableLengthDescriptorBits([u8; 3]);
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct VariableLengthDescriptor {
     bits: VariableLengthDescriptorBits,
     parent_type: Box<DatatypeMessage>,
 }
 
 #[derive(BinRead, Debug)]
+#[allow(dead_code)]
 pub struct FillValueMessage {
     //#[br(assert(version == 1))]
     version: u8,
@@ -354,6 +356,7 @@ pub struct FillValueMessage {
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct DataLayoutMessage {
     pub version: u8,
     #[br(args { version })]
@@ -361,6 +364,7 @@ pub struct DataLayoutMessage {
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 #[br(import { version: u8 })]
 pub enum DataLayoutInner {
     #[br(pre_assert(version < 3))]
@@ -370,6 +374,7 @@ pub enum DataLayoutInner {
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct DataLayoutV12 {
     dimensionality: u8,
     #[br(pad_after = 5)]
@@ -383,6 +388,7 @@ pub struct DataLayoutV12 {
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct DataLayoutV3 {
     pub layout_class: u8,
     #[br(args { layout_class })]
@@ -390,6 +396,7 @@ pub struct DataLayoutV3 {
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 #[br(import { layout_class: u8 })]
 pub enum LayoutInner {
     #[br(pre_assert(layout_class == 0))]
@@ -401,6 +408,7 @@ pub enum LayoutInner {
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct DataLayoutCompact {
     pub size: u16,
     #[br(count = size)]
@@ -408,12 +416,14 @@ pub struct DataLayoutCompact {
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct DataLayoutContiguous {
     pub address: u64,
     pub size: u64,
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct DataLayoutChunked {
     pub dimensionality: u8,
     /// Pointer to a Version 1 B-Tree of the chunk data.
@@ -436,6 +446,7 @@ pub struct SymbolTableMessage {
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct FilterMessage {
     pub version: u8,
     #[br(pad_after = 6)]
@@ -458,6 +469,7 @@ pub enum FilterType {
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct FilterDescription {
     pub filter_type: FilterType,
     pub name_length: u16,
@@ -475,6 +487,7 @@ pub struct FilterDescription {
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct AttributeMessage {
     #[br(assert(version == 1))]
     version: u8,
@@ -493,6 +506,7 @@ pub struct AttributeMessage {
     pub data: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl AttributeMessage {
     pub fn name(&self) -> String {
         self.name.to_string()
@@ -535,6 +549,7 @@ impl AttributeMessage {
 }
 
 #[derive(BinRead, Debug)]
+#[allow(dead_code)]
 struct ModificationTimMessage {
     #[br(pad_after = 3)]
     version: u8,

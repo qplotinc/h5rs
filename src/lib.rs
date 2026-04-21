@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![deny(unsafe_code)]
 
 use crate::error::H5Result;
 use crate::format::{
@@ -60,7 +60,7 @@ pub async fn list_datasets(
                 read_metadata(file, ste.object_header_address).await?;
             header.load_continuation_messages(file).await?;
 
-            if let Some(result) = header.to_group(name.clone(), file).await {
+            if let Some(result) = header.to_group(file).await {
                 let g = result?;
                 stack.push((g, child_path));
             } else if let Some(ds) = header.to_dataset(name.clone()) {
@@ -133,7 +133,6 @@ pub async fn open_chunked_dataset(
 }
 
 struct File {
-    superblock: SuperblockV0,
     pub root_group: Group,
 }
 
@@ -145,31 +144,27 @@ impl File {
             read_metadata(file, sb.root_group_symbol_table_entry.object_header_address).await?;
         root_group.load_continuation_messages(file).await?;
 
-        let rg = root_group.to_group("/".to_string(), file).await.unwrap()?;
+        let rg = root_group.to_group(file).await.unwrap()?;
 
-        Ok(File {
-            superblock: sb,
-            root_group: rg,
-        })
+        Ok(File { root_group: rg })
     }
 }
 
 struct Object {
-    name: String,
     header: DataObjectHeader,
 }
 
 impl Object {
     pub async fn to_group(&self, file: &ObjectStoreFile) -> H5Result<Option<Group>> {
-        match self.header.to_group(self.name.clone(), file).await {
+        match self.header.to_group(file).await {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
         }
     }
 }
 
+#[allow(dead_code)]
 struct Group {
-    name: String,
     btree: GroupBTreeV1,
     loaded_local_heap: LoadedLocalHeap,
     pub attributes: Vec<AttributeMessage>,
@@ -204,24 +199,13 @@ impl Group {
         read_metadata(file, ptr.child_pointer).await
     }
 
-    async fn load_object(
-        &self,
-        ptr: &SymbolTableEntry,
-        file: &ObjectStoreFile,
-    ) -> H5Result<Object> {
-        let name = self.loaded_local_heap.get_string(ptr.link_name_offset)?;
-        let header: DataObjectHeader = read_metadata(file, ptr.object_header_address).await?;
-
-        Ok(Object { name, header })
-    }
-
     async fn find_obj(
         &self,
         name: impl AsRef<str>,
         file: &ObjectStoreFile,
     ) -> H5Result<Option<Object>> {
         let r = self.object_refs(file).await?;
-        let Some((name, ste)) = r.iter().find(|(n, _)| n == name.as_ref()) else {
+        let Some((_, ste)) = r.iter().find(|(n, _)| n == name.as_ref()) else {
             println!("didn't find object: {}", name.as_ref());
             return Ok(None);
         };
@@ -229,13 +213,11 @@ impl Group {
         let mut header: DataObjectHeader = read_metadata(file, ste.object_header_address).await?;
         header.load_continuation_messages(file).await?;
 
-        Ok(Some(Object {
-            name: name.clone(),
-            header,
-        }))
+        Ok(Some(Object { header }))
     }
 }
 
+#[allow(dead_code)]
 struct Dataset {
     name: String,
     dataspace: DataspaceMessage,
@@ -259,7 +241,6 @@ impl Dataset {
             name: self.name.clone(),
             dataspace: self.dataspace.clone(),
             datatype: self.datatype.clone(),
-            layout: self.layout.clone(),
             filter: self.filter.clone(),
             chunks_layout: chunk,
         })
@@ -381,7 +362,7 @@ mod test {
                 read_metadata(file, ste.object_header_address).await?;
             header.load_continuation_messages(file).await?;
 
-            if let Some(result) = header.to_group(name.clone(), file).await {
+            if let Some(result) = header.to_group(file).await {
                 let g = result?;
                 let hdf5_group = hf.group(&child_path).unwrap();
                 compare_attrs(&g.attributes, &hdf5_group, &child_path);

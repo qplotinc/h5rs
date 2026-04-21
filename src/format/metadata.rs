@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use std::io::Cursor;
 
 use binrw::{BinRead, BinResult, NullString};
@@ -9,6 +8,7 @@ use crate::object_store::{ObjectStoreFile, fetch_exact};
 
 #[derive(BinRead, Debug)]
 #[br(magic = b"\x89HDF\r\n\x1a\n")]
+#[allow(dead_code)]
 pub struct SuperblockV0 {
     pub superblock_version: u8,
     pub free_space_version: u8,
@@ -35,6 +35,7 @@ pub struct SuperblockV0 {
 
 #[derive(BinRead, Debug)]
 #[br(magic = b"\x89HDF\r\n\x1a\n")]
+#[allow(dead_code)]
 pub struct SuperblockV2 {
     superblock_version: u8,
     size_of_offsets: u8,
@@ -51,6 +52,7 @@ pub struct SuperblockV2 {
 /// https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#subsubsec_fmt4_infra_btrees_v1
 #[derive(BinRead, Debug, Clone)]
 #[br(magic = b"TREE")]
+#[allow(dead_code)]
 pub struct GroupBTreeV1 {
     #[br(assert(node_type == 0))]
     node_type: u8,
@@ -82,6 +84,7 @@ impl BTree for GroupBTreeV1 {
 }
 
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct GroupPointerV1 {
     pub key: u64,
     pub child_pointer: u64,
@@ -96,6 +99,7 @@ impl HasPointer for GroupPointerV1 {
 #[derive(BinRead, Debug, Clone)]
 #[br(magic = b"TREE")]
 #[br(import(dim: u8))]
+#[allow(dead_code)]
 pub struct ChunkBTreeV1 {
     #[br(assert(node_type == 1))]
     node_type: u8,
@@ -166,6 +170,7 @@ impl ChunkPointerV1 {
 /// https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#subsec_fmt4_infra_symboltable
 #[derive(BinRead, Debug)]
 #[br(magic = b"SNOD")]
+#[allow(dead_code)]
 pub struct GroupSymbolTableNode {
     verion: u8,
     reserved: u8,
@@ -178,6 +183,7 @@ pub struct GroupSymbolTableNode {
 /// Symbol Table Entry
 /// https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#subsec_fmt4_infra_symboltableentry
 #[derive(BinRead, Debug, Clone)]
+#[allow(dead_code)]
 pub struct SymbolTableEntry {
     pub link_name_offset: u64,
     pub object_header_address: u64,
@@ -192,6 +198,7 @@ pub struct SymbolTableEntry {
 /// https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#subsec_fmt4_infra_localheap
 #[derive(BinRead, Debug, Clone)]
 #[br(magic = b"HEAP")]
+#[allow(dead_code)]
 pub struct LocalHeap {
     #[br(pad_after = 3)]
     pub verion: u8,
@@ -203,16 +210,11 @@ pub struct LocalHeap {
 impl LocalHeap {
     pub async fn load(&self, file: &ObjectStoreFile) -> H5Result<LoadedLocalHeap> {
         let data = fetch_exact(file, self.data_segment_address, self.data_segment_size).await?;
-
-        Ok(LoadedLocalHeap {
-            header: self.clone(),
-            data: data.to_vec(),
-        })
+        Ok(LoadedLocalHeap { data: data.to_vec() })
     }
 }
 
 pub struct LoadedLocalHeap {
-    header: LocalHeap,
     data: Vec<u8>,
 }
 

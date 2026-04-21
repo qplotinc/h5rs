@@ -2,18 +2,18 @@ use crate::format::object::{DatatypeMessage, TypeDescriptor};
 
 /// Trait for Rust types that correspond to HDF5 scalar datatypes.
 ///
-/// # Safety
 /// Implementors must ensure that the type's in-memory layout exactly matches
-/// the HDF5 on-disk layout when `check_dtype` succeeds (i.e., the type must
-/// be `Pod`-safe and the size/signedness/class must match).
-pub unsafe trait H5Type: bytemuck::Pod {
+/// the HDF5 on-disk layout when `check_dtype` succeeds.  The `bytemuck::Pod`
+/// bound already enforces the memory-safety invariant; `check_dtype` verifies
+/// the size/signedness/class at runtime.
+pub trait H5Type: bytemuck::Pod {
     /// Panic if the HDF5 datatype does not exactly match this Rust type's layout.
     fn check_dtype(dtype: &DatatypeMessage);
 }
 
 macro_rules! impl_fixed_point {
     ($ty:ty, $signed:expr) => {
-        unsafe impl H5Type for $ty {
+        impl H5Type for $ty {
             fn check_dtype(dtype: &DatatypeMessage) {
                 let TypeDescriptor::FixedPoint(ref fp) = dtype.type_desc else {
                     panic!(
@@ -42,7 +42,7 @@ macro_rules! impl_fixed_point {
 
 macro_rules! impl_float {
     ($ty:ty) => {
-        unsafe impl H5Type for $ty {
+        impl H5Type for $ty {
             fn check_dtype(dtype: &DatatypeMessage) {
                 let TypeDescriptor::FloatingPoint(ref fp) = dtype.type_desc else {
                     panic!(

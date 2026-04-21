@@ -55,7 +55,7 @@ mod tests {
         let root_group_symbol_table = root_group.symbol_table_message().unwrap();
 
         let rg = root_group
-            .to_group("/".to_string(), &file)
+            .to_group(&file)
             .await
             .unwrap()?;
 

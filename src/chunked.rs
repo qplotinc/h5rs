@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::ops::Range;
 
 use crate::error::H5Result;
@@ -7,7 +5,7 @@ use crate::format::{
     btree::collect_btree_leaves_args,
     metadata::{ChunkBTreeV1, ChunkPointerV1},
     object::{
-        DataLayoutChunked, DataLayoutMessage, DataspaceMessage, DatatypeMessage, FilterMessage,
+        DataLayoutChunked, DataspaceMessage, DatatypeMessage, FilterMessage,
         FilterType,
     },
 };
@@ -31,33 +29,6 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
         strides[d] = strides[d + 1] * shape[d + 1];
     }
     strides
-}
-
-/// Copy a rectangular sub-region from `src` into `dst`, both N-dimensional
-/// arrays stored in row-major order.
-fn copy_region<T: bytemuck::Pod>(
-    src: &[T],
-    src_shape: &[usize],
-    src_start: &[usize],
-    dst: &mut [T],
-    dst_shape: &[usize],
-    dst_start: &[usize],
-    size: &[usize],
-) {
-    let elem_size = std::mem::size_of::<T>();
-    let src_strides = row_major_strides(src_shape);
-    let dst_strides = row_major_strides(dst_shape);
-    copy_region_inner(
-        bytemuck::cast_slice(src),
-        elem_size,
-        &src_strides,
-        src_start,
-        bytemuck::cast_slice_mut(dst),
-        &dst_strides,
-        dst_start,
-        size,
-        0,
-    );
 }
 
 /// Copy a rectangular sub-region from raw bytes (with element layout of size
@@ -118,7 +89,6 @@ pub struct ChunkedDataset {
     pub(crate) name: String,
     pub(crate) dataspace: DataspaceMessage,
     pub(crate) datatype: DatatypeMessage,
-    pub(crate) layout: DataLayoutMessage,
     pub(crate) chunks_layout: DataLayoutChunked,
     pub(crate) filter: Option<FilterMessage>,
 }
