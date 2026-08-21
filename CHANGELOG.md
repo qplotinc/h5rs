@@ -23,11 +23,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decodes correctly instead of failing or returning garbage.
 - `ChunkedDataset::chunk_index_name` reports which index structure a dataset
   uses.
+- Read paths for the contiguous and compact storage layouts, alongside the
+  existing chunked one. A contiguous range read fetches a single byte span
+  covering the selection rather than the whole dataset.
+- Support for scalar and null dataspaces.
+- `Dataset::layout_name`, and a `layout` field on `DatasetInfo`.
 - A `dump` example that lists a file's datasets and reads one.
 
 ### Changed
 
-- Round-trip and fuzz tests now run against both on-disk formats.
+- **Breaking:** `ChunkedDataset` is now `Dataset` and `open_chunked_dataset` is
+  now `open_dataset`, since reads are no longer limited to chunked datasets.
+  `chunk_shape` and `chunk_index_name` return `Option`, being `None` for a
+  dataset that is not chunked.
+- Object headers are read in two phases — prefix first, then the exact extent —
+  so a header larger than the default metadata fetch (a big compact dataset, or
+  a long run of attributes) no longer fails to parse.
+- Round-trip and fuzz tests now run against both on-disk formats and all three
+  storage layouts.
 - Unsupported filter pipelines are rejected before any chunk is fetched, rather
   than being fed to the zlib decoder.
 

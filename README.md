@@ -38,19 +38,22 @@ for info in h5rs::list_datasets(&file).await? {
     println!("{} shape={:?} filters={:?}", info.path, info.shape, info.filters);
 }
 
-let ds = h5rs::open_chunked_dataset(&file, &["matrix", "data"])
+let ds = h5rs::open_dataset(&file, &["matrix", "data"])
     .await?
     .expect("dataset not found");
 
 // Read everything...
 let all = ds.read_full::<u32>(&file).await?;
 
-// ...or just the slice you need. Only the overlapping chunks are fetched
-// and decompressed.
+// ...or just the slice you need. Only the bytes covering it are fetched:
+// the overlapping chunks of a chunked dataset, or the enclosing byte span
+// of a contiguous one.
 let slice = ds.read_range::<u32>(&[1_000..2_000], &file).await?;
 ```
 
 Swap `LocalFileSystem` for `AmazonS3`, `GoogleCloudStorage`, `MicrosoftAzure`, or `HttpStore` and the same code reads over the network, issuing one ranged GET per chunk.
+
+For a contiguous dataset a range read is a single ranged GET covering the selection — exact for a one-dimensional range, and spanning the touched rows for higher-rank selections.
 
 ## Implemented
 - Support widely used HDF5 features, in both the pre-1.10 and the 1.10+ on-disk formats
@@ -68,8 +71,9 @@ h5rs reads both of the on-disk formats the HDF5 library emits: the "earliest" en
 | Object header | v1, v2 (`OHDR`), continuation blocks | shared messages |
 | Group links | symbol table, compact link messages, fractal heap + v2 B-tree | soft, external and user-defined links |
 | Chunk index | v1 B-tree, single chunk, implicit, fixed array, extensible array, v2 B-tree | |
-| Data layout | chunked (message v1-v5) | contiguous, compact and virtual are listed but not read |
+| Data layout | chunked, contiguous, compact (message v1-v5) | virtual |
 | Filters | deflate (gzip), shuffle, per-chunk filter masks | szip, blosc, lzf, n-bit, scale-offset, fletcher32 |
+| Dataspaces | simple, scalar, null (message v1-v2) | permutation indices |
 | Datatypes | fixed-point, floating-point, string, variable-length | compound, enum, array, reference |
 | Attributes | message v1-v3, compact and dense | shared datatypes and dataspaces |
 

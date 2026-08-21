@@ -148,6 +148,12 @@ pub(crate) async fn read_metadata_args<T: for<'a> BinRead<Args<'a> = A>, A: Clon
     read_and_parse_args(file, offset, METADATA_FETCH_SIZE, args).await
 }
 
+/// Fetch the default metadata block at `offset` without parsing it, for
+/// structures whose true length is only known once their prefix is read.
+pub(crate) async fn fetch_metadata_block(file: &ObjectStoreFile, offset: u64) -> H5Result<Bytes> {
+    fetch_exact(file, offset, METADATA_FETCH_SIZE).await
+}
+
 /// Fetch raw bytes at `offset` of length `len`.
 pub(crate) async fn fetch_exact(file: &ObjectStoreFile, offset: u64, len: u64) -> H5Result<Bytes> {
     Ok(file.get_range(offset..offset + len).await?)

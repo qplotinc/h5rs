@@ -31,9 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (false, false) => "uint",
         };
         println!(
-            "{:40} shape={:?} chunks={:?} type={kind}{} filters={:?}",
+            "{:40} shape={:?} {} chunks={:?} type={kind}{} filters={:?}",
             info.path,
             info.shape,
+            info.layout,
             info.chunk_shape,
             bytes * 8,
             info.filters
@@ -44,16 +45,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     let segments: Vec<&str> = wanted.trim_start_matches('/').split('/').collect();
-    let ds = h5rs::open_chunked_dataset(&file, &segments)
+    let ds = h5rs::open_dataset(&file, &segments)
         .await?
-        .ok_or("no such chunked dataset")?;
+        .ok_or("no such dataset")?;
 
     let (is_float, is_signed, bytes) = ds.dtype_info();
     println!(
-        "\n{wanted}: shape {:?}, chunks {:?}, {} index",
+        "\n{wanted}: shape {:?}, {} layout, chunks {:?}{}",
         ds.shape(),
+        ds.layout_name(),
         ds.chunk_shape(),
-        ds.chunk_index_name()
+        match ds.chunk_index_name() {
+            Some(index) => format!(", {index} index"),
+            None => String::new(),
+        }
     );
     match (is_float, is_signed, bytes) {
         (false, false, 1) => print_head(ds.read_full::<u8>(&file).await?.data),

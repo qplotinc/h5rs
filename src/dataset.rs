@@ -1,16 +1,19 @@
-//! Reading chunked datasets: chunk B-tree traversal, filter decoding, and
-//! sub-region assembly.
+//! Reading dataset raw data: chunk traversal and filter decoding for chunked
+//! datasets, and byte-range extraction for contiguous and compact ones.
 
+use std::io::Read;
 use std::ops::Range;
 
 use crate::error::{H5Error, H5Result};
 use crate::format::{
     chunk_index::{ChunkRecord, enumerate_chunks},
-    object::{ChunkedLayout, DataspaceMessage, DatatypeMessage, FilterMessage, FilterType},
+    object::{
+        AttributeMessage, ChunkedLayout, DataLayoutMessage, DataspaceMessage, DatatypeMessage,
+        FilterMessage, FilterType, LayoutInner, is_undefined_address,
+    },
 };
 use crate::h5type::H5Type;
 use crate::object_store::{ObjectStoreFile, fetch_exact};
-use std::io::Read;
 
 /// N-dimensional array wrapper that pairs a flat data vector with its logical shape.
 /// Data is in row-major (C) order.
@@ -87,21 +90,26 @@ fn copy_region_inner(
     }
 }
 
-/// A chunked HDF5 dataset, opened and ready to read.
+/// An HDF5 dataset, opened and ready to read.
 ///
-/// Holds only the dataset's metadata — the dataspace, datatype, chunk layout
+/// Holds only the dataset's metadata — its dataspace, datatype, storage layout
 /// and filter pipeline. No bulk data is fetched until you call
 /// [`read_full`](Self::read_full) or [`read_range`](Self::read_range), and a
-/// range read fetches only the chunks that overlap the selection.
-pub struct ChunkedDataset {
+/// range read fetches only the bytes it needs: the overlapping chunks of a
+/// chunked dataset, or the enclosing byte span of a contiguous one.
+pub struct Dataset {
     pub(crate) name: String,
     pub(crate) dataspace: DataspaceMessage,
     pub(crate) datatype: DatatypeMessage,
-    pub(crate) chunks_layout: ChunkedLayout,
+    pub(crate) layout: DataLayoutMessage,
     pub(crate) filter: Option<FilterMessage>,
+    /// Read by the differential tests, which compare every attribute against
+    /// the HDF5 C library. There is no public accessor yet.
+    #[allow(dead_code)]
+    pub(crate) attributes: Vec<AttributeMessage>,
 }
 
-impl ChunkedDataset {
+impl Dataset {
     /// The dataset's name (its last path segment).
     pub fn name(&self) -> &str {
         &self.name
@@ -119,7 +127,7 @@ impl ChunkedDataset {
         }
     }
 
-    /// Number of dimensions.
+    /// Number of dimensions. Zero for a scalar or null dataspace.
     pub fn ndim(&self) -> usize {
         self.dataspace.dimensionality as usize
     }
@@ -131,27 +139,40 @@ impl ChunkedDataset {
 
     /// Length of each dataset dimension, outermost first.
     pub fn shape(&self) -> Vec<u64> {
-        self.dataspace.dimension[..self.ndim()].to_vec()
+        self.dataset_dims().to_vec()
     }
 
-    /// Length of each chunk dimension, outermost first.
-    pub fn chunk_shape(&self) -> Vec<u64> {
-        self.chunks_layout.chunk_dims.clone()
+    /// How the raw data is stored: `"chunked"`, `"contiguous"`, `"compact"`,
+    /// or `"virtual"`.
+    pub fn layout_name(&self) -> &'static str {
+        match &self.layout.inner {
+            LayoutInner::Chunked(_) => "chunked",
+            LayoutInner::Contiguous { .. } => "contiguous",
+            LayoutInner::Compact { .. } => "compact",
+            LayoutInner::Unsupported(_) => "virtual",
+        }
+    }
+
+    /// Length of each chunk dimension, outermost first, or `None` if the
+    /// dataset is not chunked.
+    pub fn chunk_shape(&self) -> Option<Vec<u64>> {
+        self.layout.chunked().map(|c| c.chunk_dims.clone())
     }
 
     /// Name of the structure used to locate this dataset's chunks, for
     /// diagnostics: `"v1 btree"`, `"single chunk"`, `"implicit"`,
-    /// `"fixed array"`, `"extensible array"` or `"v2 btree"`.
-    pub fn chunk_index_name(&self) -> &'static str {
+    /// `"fixed array"`, `"extensible array"` or `"v2 btree"`. `None` if the
+    /// dataset is not chunked.
+    pub fn chunk_index_name(&self) -> Option<&'static str> {
         use crate::format::object::ChunkIndex::*;
-        match self.chunks_layout.index {
+        self.layout.chunked().map(|c| match c.index {
             BTreeV1 { .. } => "v1 btree",
             SingleChunk { .. } => "single chunk",
             Implicit { .. } => "implicit",
             FixedArray { .. } => "fixed array",
             ExtensibleArray { .. } => "extensible array",
             BTreeV2 { .. } => "v2 btree",
-        }
+        })
     }
 
     /// Returns (is_float, is_signed, byte_size) for the dataset's scalar type.
@@ -164,7 +185,16 @@ impl ChunkedDataset {
         }
     }
 
-    /// Reject filter pipelines h5rs cannot decode, before any chunk is fetched.
+    /// The chunked layout, or an error naming the layout this dataset actually
+    /// uses.
+    #[cfg(test)]
+    fn chunked_layout(&self) -> H5Result<&ChunkedLayout> {
+        self.layout.chunked().ok_or_else(|| {
+            H5Error::corrupt(format!("dataset is {}, not chunked", self.layout_name()))
+        })
+    }
+
+    /// Reject filter pipelines h5rs cannot decode, before any data is fetched.
     ///
     /// Only deflate (gzip) and shuffle are implemented. Silently returning
     /// garbage for szip or a checksum filter would be worse than an error.
@@ -182,6 +212,20 @@ impl ChunkedDataset {
                 }
             }
         }
+
+        // HDF5 only applies the filter pipeline to chunked datasets. A pipeline
+        // on any other layout would mean the bytes on disk are not what the
+        // dataspace and datatype describe.
+        let has_filters = fm
+            .filters
+            .iter()
+            .any(|fd| fd.filter_type != FilterType::None);
+        if has_filters && self.layout.chunked().is_none() {
+            return Err(H5Error::unsupported(format!(
+                "filter pipeline on a {} dataset",
+                self.layout_name()
+            )));
+        }
         Ok(())
     }
 
@@ -196,6 +240,7 @@ impl ChunkedDataset {
     /// fetched bytes without copying them.
     fn decode_filters(
         &self,
+        layout: &ChunkedLayout,
         c: &ChunkRecord,
         stored: &[u8],
         uncompressed_bytes: usize,
@@ -223,7 +268,7 @@ impl ChunkedDataset {
                         })?;
                     Some(out)
                 }
-                FilterType::Shuffle => Some(self.unshuffle(input)?),
+                FilterType::Shuffle => Some(unshuffle(input, layout.element_size as usize)?),
                 // check_filters_supported rejects everything else up front.
                 ref other => {
                     return Err(H5Error::unsupported(format!("{other:?} filter")));
@@ -233,31 +278,13 @@ impl ChunkedDataset {
         Ok(decoded)
     }
 
-    /// Reverse the shuffle filter, which stores all the first bytes of each
-    /// element, then all the second bytes, and so on.
-    fn unshuffle(&self, data: &[u8]) -> H5Result<Vec<u8>> {
-        let element_size = self.chunks_layout.element_size as usize;
-        if element_size == 0 {
-            return Err(H5Error::corrupt(
-                "chunk layout has no element size for the shuffle filter",
-            ));
-        }
-        let num_elements = data.len() / element_size;
-        let mut out = vec![0u8; data.len()];
-        for i in 0..num_elements {
-            for b in 0..element_size {
-                out[i * element_size + b] = data[b * num_elements + i];
-            }
-        }
-        Ok(out)
-    }
-
     /// Decode a chunk and copy the specified sub-region directly into `dst`.
     /// For unfiltered data, copies directly from the fetched bytes into `dst`
     /// with no intermediate buffer.
     #[allow(clippy::too_many_arguments)]
     async fn read_chunk_into<T: H5Type>(
         &self,
+        layout: &ChunkedLayout,
         c: &ChunkRecord,
         file: &ObjectStoreFile,
         chunk_shape: &[usize],
@@ -268,11 +295,11 @@ impl ChunkedDataset {
         size: &[usize],
     ) -> H5Result<()> {
         let elem_size = std::mem::size_of::<T>();
+        let uncompressed_bytes = layout.chunk_bytes() as usize;
 
         if self.filter.is_none() {
             // Unfiltered: fetch bytes and copy sub-region directly into dst.
             // No intermediate Vec<T> needed.
-            let uncompressed_bytes = self.chunks_layout.chunk_bytes() as usize;
             if uncompressed_bytes != c.size as usize {
                 return Err(H5Error::corrupt(format!(
                     "unfiltered chunk at {} records {} bytes but its layout implies {}",
@@ -297,9 +324,8 @@ impl ChunkedDataset {
         } else {
             // Filtered: run the pipeline backwards into a temp buffer, then copy
             // the sub-region out of it.
-            let uncompressed_bytes = self.chunks_layout.chunk_bytes() as usize;
             let stored = fetch_exact(file, c.address, c.size).await?;
-            let decoded = self.decode_filters(c, &stored, uncompressed_bytes)?;
+            let decoded = self.decode_filters(layout, c, &stored, uncompressed_bytes)?;
             let data: &[u8] = decoded.as_deref().unwrap_or(&stored);
 
             if data.len() != uncompressed_bytes {
@@ -332,25 +358,27 @@ impl ChunkedDataset {
 
     /// Read the entire dataset, returning an NdArray with the dataset's shape.
     pub async fn read_full<T: H5Type>(&self, file: &ObjectStoreFile) -> H5Result<NdArray<T>> {
-        let ndim = self.dataspace.dimensionality as usize;
-        let sel: Vec<std::ops::Range<u64>> = self.dataspace.dimension[..ndim]
-            .iter()
-            .map(|&d| 0..d)
-            .collect();
+        let sel: Vec<Range<u64>> = self.dataset_dims().iter().map(|&d| 0..d).collect();
         self.read_range(&sel, file).await
     }
 
-    /// Read a rectangular sub-region of the dataset, only fetching and
-    /// decompressing the chunks that overlap with `selection`.
+    /// Read a rectangular sub-region of the dataset.
     ///
-    /// `selection` must contain one `Range<u64>` per dataset dimension.
-    /// Ranges are clamped to the dataset extent.
+    /// `selection` must contain one `Range<u64>` per dataset dimension; a
+    /// scalar dataset takes an empty selection. Ranges are clamped to the
+    /// dataset extent.
+    ///
+    /// Only the bytes needed are fetched. For a chunked dataset that means the
+    /// chunks the selection overlaps; for a contiguous one, the single byte
+    /// span running from the first selected element to the last — which is
+    /// exact for a one-dimensional range, and for higher-rank selections spans
+    /// the rows the selection touches.
     pub async fn read_range<T: H5Type>(
         &self,
         selection: &[Range<u64>],
         file: &ObjectStoreFile,
     ) -> H5Result<NdArray<T>> {
-        let ndim = self.dataspace.dimensionality as usize;
+        let ndim = self.ndim();
         if selection.len() != ndim {
             return Err(H5Error::InvalidSelection(format!(
                 "selection has {} range(s) but the dataset has {ndim} dimension(s)",
@@ -360,13 +388,7 @@ impl ChunkedDataset {
         self.check_filters_supported()?;
         T::check_dtype(&self.datatype)?;
 
-        let dataset_dims: &[u64] = &self.dataspace.dimension[..ndim];
-        let chunk_dims: Vec<usize> = self
-            .chunks_layout
-            .chunk_dims
-            .iter()
-            .map(|&d| d as usize)
-            .collect();
+        let dataset_dims = self.dataset_dims();
 
         // Clamp selection to dataset extent
         let sel: Vec<Range<u64>> = (0..ndim)
@@ -378,7 +400,13 @@ impl ChunkedDataset {
             .collect();
 
         let output_shape: Vec<usize> = sel.iter().map(|r| (r.end - r.start) as usize).collect();
-        let total_elements: usize = output_shape.iter().product();
+        // A scalar dataspace has no dimensions but one element; a null
+        // dataspace has none.
+        let total_elements: usize = if self.dataspace.is_null() {
+            0
+        } else {
+            output_shape.iter().product()
+        };
 
         if total_elements == 0 {
             return Ok(NdArray {
@@ -388,7 +416,54 @@ impl ChunkedDataset {
         }
 
         let mut output = vec![T::zeroed(); total_elements];
-        let all_chunks = self.collect_chunks(file).await?;
+        match &self.layout.inner {
+            LayoutInner::Chunked(layout) => {
+                self.read_chunked_into(layout, &sel, &output_shape, &mut output, file)
+                    .await?;
+            }
+            LayoutInner::Contiguous { address, size } => {
+                self.read_contiguous_into(*address, *size, &sel, &output_shape, &mut output, file)
+                    .await?;
+            }
+            LayoutInner::Compact { data } => {
+                self.read_compact_into(data, &sel, &output_shape, &mut output)?;
+            }
+            LayoutInner::Unsupported(class) => {
+                return Err(H5Error::unsupported(format!(
+                    "data layout class {class} (virtual datasets are not implemented)"
+                )));
+            }
+        }
+
+        Ok(NdArray {
+            data: output,
+            shape: output_shape,
+        })
+    }
+
+    /// Fill `output` from the chunks that overlap `sel`.
+    async fn read_chunked_into<T: H5Type>(
+        &self,
+        layout: &ChunkedLayout,
+        sel: &[Range<u64>],
+        output_shape: &[usize],
+        output: &mut [T],
+        file: &ObjectStoreFile,
+    ) -> H5Result<()> {
+        let ndim = self.ndim();
+        if ndim == 0 {
+            return Err(H5Error::corrupt("a scalar dataset cannot be chunked"));
+        }
+        if layout.ndim() != ndim {
+            return Err(H5Error::corrupt(format!(
+                "chunk layout has {} dimensions but the dataspace has {ndim}",
+                layout.ndim()
+            )));
+        }
+
+        let dataset_dims = self.dataset_dims();
+        let chunk_dims: Vec<usize> = layout.chunk_dims.iter().map(|&d| d as usize).collect();
+        let all_chunks = enumerate_chunks(file, layout, dataset_dims).await?;
 
         for chunk_ptr in &all_chunks {
             let chunk_offset: &[u64] = &chunk_ptr.offsets;
@@ -422,29 +497,159 @@ impl ChunkedDataset {
                 .collect();
 
             self.read_chunk_into(
+                layout,
                 chunk_ptr,
                 file,
                 &chunk_dims,
                 &chunk_local_start,
-                &mut output,
-                &output_shape,
+                output,
+                output_shape,
                 &output_start,
                 &inter_size,
             )
             .await?;
         }
-
-        Ok(NdArray {
-            data: output,
-            shape: output_shape,
-        })
+        Ok(())
     }
 
-    /// Walk the chunk B-tree and collect a pointer to every chunk.
+    /// Fill `output` from a contiguous run of raw data.
+    ///
+    /// The whole dataset is one row-major array on disk, so the selection maps
+    /// to a single byte span: from the first selected element to the last. That
+    /// span is fetched in one request and the sub-region copied out of it.
+    async fn read_contiguous_into<T: H5Type>(
+        &self,
+        address: u64,
+        allocated_size: u64,
+        sel: &[Range<u64>],
+        output_shape: &[usize],
+        output: &mut [T],
+        file: &ObjectStoreFile,
+    ) -> H5Result<()> {
+        // No storage allocated yet: the dataset reads as its fill value.
+        if is_undefined_address(address) {
+            return Ok(());
+        }
+
+        let elem_size = std::mem::size_of::<T>();
+        let dst: &mut [u8] = bytemuck::cast_slice_mut(output);
+
+        if self.ndim() == 0 {
+            let bytes = fetch_exact(file, address, elem_size as u64).await?;
+            dst[..elem_size].copy_from_slice(&bytes[..elem_size]);
+            return Ok(());
+        }
+
+        let strides = row_major_strides(&dims_as_usize(self.dataset_dims()));
+
+        // Offset of the first selected element, and how far past it the last
+        // selected element lies.
+        let first: usize = (0..sel.len())
+            .map(|d| sel[d].start as usize * strides[d])
+            .sum();
+        let span: usize = (0..output_shape.len())
+            .map(|d| (output_shape[d] - 1) * strides[d])
+            .sum::<usize>()
+            + 1;
+
+        let end = (first + span) as u64 * elem_size as u64;
+        if allocated_size > 0 && end > allocated_size {
+            return Err(H5Error::corrupt(format!(
+                "contiguous dataset needs {end} bytes but only {allocated_size} are allocated"
+            )));
+        }
+
+        let bytes = fetch_exact(
+            file,
+            address + (first * elem_size) as u64,
+            (span * elem_size) as u64,
+        )
+        .await?;
+
+        // The fetched buffer begins at the first selected element, so within it
+        // the selection starts at the origin while keeping the dataset's strides.
+        let origin = vec![0usize; sel.len()];
+        copy_region_inner(
+            &bytes,
+            elem_size,
+            &strides,
+            &origin,
+            dst,
+            &row_major_strides(output_shape),
+            &origin,
+            output_shape,
+            0,
+        );
+        Ok(())
+    }
+
+    /// Fill `output` from raw data stored inline in the object header.
+    fn read_compact_into<T: H5Type>(
+        &self,
+        data: &[u8],
+        sel: &[Range<u64>],
+        output_shape: &[usize],
+        output: &mut [T],
+    ) -> H5Result<()> {
+        let elem_size = std::mem::size_of::<T>();
+        let needed = self.dataspace.num_elements() * elem_size;
+        if data.len() < needed {
+            return Err(H5Error::corrupt(format!(
+                "compact dataset holds {} bytes but its dataspace needs {needed}",
+                data.len()
+            )));
+        }
+
+        let dst: &mut [u8] = bytemuck::cast_slice_mut(output);
+        if self.ndim() == 0 {
+            dst[..elem_size].copy_from_slice(&data[..elem_size]);
+            return Ok(());
+        }
+
+        let src_offset: Vec<usize> = sel.iter().map(|r| r.start as usize).collect();
+        copy_region_inner(
+            data,
+            elem_size,
+            &row_major_strides(&dims_as_usize(self.dataset_dims())),
+            &src_offset,
+            dst,
+            &row_major_strides(output_shape),
+            &vec![0usize; sel.len()],
+            output_shape,
+            0,
+        );
+        Ok(())
+    }
+
+    /// Walk the chunk index and collect a record for every allocated chunk.
+    #[cfg(test)]
     pub(crate) async fn collect_chunks(
         &self,
         file: &ObjectStoreFile,
     ) -> H5Result<Vec<ChunkRecord>> {
-        enumerate_chunks(file, &self.chunks_layout, self.dataset_dims()).await
+        let layout = self.chunked_layout()?;
+        enumerate_chunks(file, layout, self.dataset_dims()).await
     }
+}
+
+fn dims_as_usize(dims: &[u64]) -> Vec<usize> {
+    dims.iter().map(|&d| d as usize).collect()
+}
+
+/// Reverse the shuffle filter, which stores all the first bytes of each
+/// element, then all the second bytes, and so on.
+fn unshuffle(data: &[u8], element_size: usize) -> H5Result<Vec<u8>> {
+    if element_size == 0 {
+        return Err(H5Error::corrupt(
+            "chunk layout has no element size for the shuffle filter",
+        ));
+    }
+    let num_elements = data.len() / element_size;
+    let mut out = vec![0u8; data.len()];
+    for i in 0..num_elements {
+        for b in 0..element_size {
+            out[i * element_size + b] = data[b * num_elements + i];
+        }
+    }
+    Ok(out)
 }

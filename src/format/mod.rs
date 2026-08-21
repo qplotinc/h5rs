@@ -59,7 +59,7 @@ mod tests {
         );
 
         let segments: Vec<&str> = chunked.path.trim_start_matches('/').split('/').collect();
-        let ds = crate::open_chunked_dataset(&file, &segments)
+        let ds = crate::open_dataset(&file, &segments)
             .await?
             .expect("chunked dataset should open");
         let chunks = ds.collect_chunks(&file).await?;

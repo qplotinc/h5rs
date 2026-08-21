@@ -53,7 +53,7 @@ The official HDF5 file format spec is available at: https://support.hdfgroup.org
 - **`src/format/fractal_heap.rs`** — Fractal heaps and the doubling table, used to dereference the heap IDs that dense links and attributes are indexed by. Heap offsets are measured from the *start of the direct block*, including its prefix.
 - **`src/format/chunk_index.rs`** — Enumerates a chunked dataset's chunks through any of the six index structures into a common `ChunkRecord`. Element widths are taken from the sizes recorded in each index header rather than recomputed.
 - **`src/format/dense.rs`** — Links and attributes stored densely (fractal heap + v2 B-tree).
-- **`src/chunked.rs`** — `ChunkedDataset`: chunk B-tree traversal, filter decoding, and sub-region assembly for `read_full`/`read_range`.
+- **`src/dataset.rs`** — `Dataset`: the public reader. Dispatches `read_full`/`read_range` across the chunked, contiguous and compact layouts, decodes the filter pipeline, and assembles sub-regions with `copy_region_inner`.
 - **`src/object_store.rs`** — `ObjectStoreFile` (ranged GETs against an `ObjectStore`) plus the crate-private binrw fetch-and-parse helpers.
 - **`src/node_store.rs` / `src/node_fs.js`** — Node.js filesystem `ObjectStore` used only by the wasm32 test build.
 
@@ -75,3 +75,5 @@ File::open → SuperblockV0 → root DataObjectHeader → Group (btree + local h
 - Object header messages are dispatched explicitly by type in `parse_inner_message`, never through a `binrw` enum with a catch-all arm: a fall-through would turn a parse failure into a silently missing message.
 - Page-initialisation bitmaps in the array indexes are most-significant-bit first within each byte, matching `H5VM_bit_get`.
 - Reader is passed around as `ObjectStoreFile` which is thin wrapper around the ObjectStore trait (object_store crate).
+- `read_metadata` fetches a fixed 8KB block, which is fine for B-tree nodes and heap headers but not for object headers — those are read in two phases via `header_chunk_extent`, since a compact dataset or a run of attributes can make one arbitrarily large.
+- A range read never fetches more than it needs: whole chunks for a chunked dataset, and for a contiguous one the single byte span from the first selected element to the last.

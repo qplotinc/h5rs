@@ -23,7 +23,7 @@
 //!     println!("{} shape={:?} filters={:?}", info.path, info.shape, info.filters);
 //! }
 //!
-//! let ds = h5rs::open_chunked_dataset(&file, &["matrix", "data"])
+//! let ds = h5rs::open_dataset(&file, &["matrix", "data"])
 //!     .await?
 //!     .expect("dataset not found");
 //!
@@ -31,7 +31,7 @@
 //! let all = ds.read_full::<u32>(&file).await?;
 //! println!("{:?} -> {} values", all.shape, all.data.len());
 //!
-//! // ...or just the slice you need. Only the overlapping chunks are fetched.
+//! // ...or just the slice you need. Only the bytes covering it are fetched.
 //! let slice = ds.read_range::<u32>(&[1_000..2_000], &file).await?;
 //! println!("{:?}", slice.shape);
 //! # Ok(())
@@ -63,8 +63,9 @@
 //! | Object header | v1, v2 (`OHDR`), continuation blocks | shared messages |
 //! | Group links | symbol table, compact link messages, fractal heap + v2 B-tree | soft, external and user-defined links |
 //! | Chunk index | v1 B-tree, single chunk, implicit, fixed array, extensible array, v2 B-tree | |
-//! | Data layout | chunked (message v1-v5) | contiguous, compact and virtual are listed but not read |
+//! | Data layout | chunked, contiguous, compact (message v1-v5) | virtual |
 //! | Filters | deflate (gzip), shuffle, per-chunk filter masks | szip, blosc, lzf, n-bit, scale-offset, fletcher32 |
+//! | Dataspaces | simple, scalar, null (message v1-v2) | permutation indices |
 //! | Datatypes | fixed-point, floating-point, string, variable-length | compound, enum, array, reference |
 //! | Attributes | message v1-v3, compact and dense | shared datatypes and dataspaces |
 //!
@@ -89,14 +90,13 @@ use crate::error::{H5Error, H5Result};
 use crate::format::{
     btree::collect_btree_leaves,
     metadata::{GroupBTreeV1, GroupPointerV1, GroupSymbolTableNode, LoadedLocalHeap, Superblock},
-    object::{
-        AttributeMessage, DataLayoutMessage, DataObjectHeader, DataspaceMessage, DatatypeMessage,
-        FilterMessage, LinkMessage, LinkTarget,
-    },
+    object::{AttributeMessage, DataObjectHeader, LinkMessage, LinkTarget},
 };
+use binrw::BinRead;
+
 use crate::object_store::{ObjectStoreFile, read_metadata};
 
-pub(crate) mod chunked;
+pub(crate) mod dataset;
 pub mod error;
 pub(crate) mod format;
 pub mod h5type;
@@ -104,7 +104,7 @@ pub mod h5type;
 mod node_store;
 pub mod object_store;
 
-pub use chunked::{ChunkedDataset, NdArray};
+pub use dataset::{Dataset, NdArray};
 
 /// Metadata about a dataset found during HDF5 tree walking.
 #[derive(Debug, Clone)]
@@ -115,6 +115,9 @@ pub struct DatasetInfo {
     pub shape: Vec<u64>,
     /// Chunk shape, if the dataset is chunked.
     pub chunk_shape: Option<Vec<u64>>,
+    /// How the raw data is stored: `"chunked"`, `"contiguous"`, `"compact"`
+    /// or `"virtual"`.
+    pub layout: &'static str,
     /// (is_float, is_signed, byte_size) for the scalar type.
     pub dtype_info: (bool, bool, usize),
     /// Names of HDF5 filters applied (e.g. "Deflate", "Shuffle").
@@ -143,27 +146,17 @@ pub async fn list_datasets(
             if let Some(g) = header.to_group(file).await? {
                 stack.push((g, child_path));
             } else if let Some(ds) = header.to_dataset(name.clone(), file).await? {
-                let ndim = ds.dataspace.dimensionality as usize;
-                let shape = ds.dataspace.dimension[..ndim].to_vec();
-                let (chunk_shape, filters) = match ds.chunked()? {
-                    Some(cds) => (Some(cds.chunk_shape()), cds.filter_names()),
-                    None => (None, vec![]),
-                };
-                let dtype_info = match &ds.datatype.type_desc {
-                    crate::format::object::TypeDescriptor::FloatingPoint(fp) => {
-                        (true, true, fp.size() as usize)
-                    }
-                    crate::format::object::TypeDescriptor::FixedPoint(fp) => {
-                        (false, fp.signed() != 0, fp.size() as usize)
-                    }
-                    _ => (false, false, ds.datatype.element_size()?),
+                let dtype_info = match ds.dtype_info() {
+                    (false, false, 0) => (false, false, ds.datatype.element_size()?),
+                    info => info,
                 };
                 results.push(DatasetInfo {
                     path: child_path,
-                    shape,
-                    chunk_shape,
+                    shape: ds.shape(),
+                    chunk_shape: ds.chunk_shape(),
+                    layout: ds.layout_name(),
                     dtype_info,
-                    filters,
+                    filters: ds.filter_names(),
                 });
             }
         }
@@ -173,14 +166,14 @@ pub async fn list_datasets(
     Ok(results)
 }
 
-/// Open an HDF5 file and navigate to a chunked dataset by internal path.
+/// Open an HDF5 file and navigate to a dataset by internal path.
 ///
 /// `internal_path` is a slice of group/dataset names, e.g. `["group1", "dataset"]`.
-/// Returns `None` if the path does not exist or the target is not a chunked dataset.
-pub async fn open_chunked_dataset(
+/// Returns `None` if the path does not exist or does not name a dataset.
+pub async fn open_dataset(
     file: &crate::object_store::ObjectStoreFile,
     internal_path: &[&str],
-) -> error::H5Result<Option<ChunkedDataset>> {
+) -> error::H5Result<Option<Dataset>> {
     let Some((dataset_name, groups)) = internal_path.split_last() else {
         return Ok(None);
     };
@@ -201,21 +194,27 @@ pub async fn open_chunked_dataset(
 
     // Last segment should be a dataset
     match current_group.find_obj(*dataset_name, file).await? {
-        Some(obj) => match obj
-            .header
-            .to_dataset(dataset_name.to_string(), file)
-            .await?
-        {
-            Some(ds) => ds.chunked(),
-            None => Ok(None),
-        },
+        Some(obj) => obj.header.to_dataset(dataset_name.to_string(), file).await,
         None => Ok(None),
     }
 }
 
 /// Read an object header at `address` and follow its continuation blocks.
+///
+/// An object header has no bounded size: a compact dataset or a run of
+/// attributes can make one arbitrarily large. So the prefix is read from a
+/// default-sized block first, and only if the header turns out to be longer is
+/// a second, exactly-sized request made.
 async fn read_object_header(file: &ObjectStoreFile, address: u64) -> H5Result<DataObjectHeader> {
-    let mut header: DataObjectHeader = read_metadata(file, address).await?;
+    let mut bytes = crate::object_store::fetch_metadata_block(file, address).await?;
+    let extent = crate::format::object::header_chunk_extent(&bytes)
+        .ok_or_else(|| H5Error::corrupt("truncated object header prefix"))?;
+    if extent > bytes.len() as u64 {
+        bytes = crate::object_store::fetch_exact(file, address, extent).await?;
+    }
+
+    let mut cursor = std::io::Cursor::new(bytes);
+    let mut header = DataObjectHeader::read_le(&mut cursor)?;
     header.load_continuation_messages(file).await?;
     Ok(header)
 }
@@ -333,41 +332,6 @@ impl Group {
     }
 }
 
-#[allow(dead_code)]
-struct Dataset {
-    name: String,
-    dataspace: DataspaceMessage,
-    datatype: DatatypeMessage,
-    layout: DataLayoutMessage,
-    filter: Option<FilterMessage>,
-    pub attributes: Vec<AttributeMessage>,
-}
-
-impl Dataset {
-    /// This dataset as a [`ChunkedDataset`], or `None` if it is not chunked.
-    pub fn chunked(&self) -> H5Result<Option<chunked::ChunkedDataset>> {
-        let Some(chunk) = self.layout.chunked() else {
-            return Ok(None);
-        };
-
-        let ndim = self.dataspace.dimensionality as usize;
-        if chunk.ndim() != ndim {
-            return Err(H5Error::corrupt(format!(
-                "chunk layout has {} dimensions but the dataspace has {ndim}",
-                chunk.ndim()
-            )));
-        }
-
-        Ok(Some(chunked::ChunkedDataset {
-            name: self.name.clone(),
-            dataspace: self.dataspace.clone(),
-            datatype: self.datatype.clone(),
-            filter: self.filter.clone(),
-            chunks_layout: chunk.clone(),
-        }))
-    }
-}
-
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "hdf5-compare"))]
 mod roundtrip {
     use std::fmt::Debug;
@@ -458,6 +422,17 @@ mod roundtrip {
         }
     }
 
+    /// How the C library should store the raw data.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Storage {
+        /// Chunked, with the chunk shape given by `RoundtripTest::chunk`.
+        Chunked,
+        /// One contiguous run outside the object header.
+        Contiguous,
+        /// Inline in the object header.
+        Compact,
+    }
+
     /// Maximum extent of one dimension, used to force an unlimited dimension
     /// and so exercise the extensible array chunk index.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,6 +450,7 @@ mod roundtrip {
         shuffle: bool,
         libver: LibVer,
         max_dims: MaxDims,
+        storage: Storage,
         /// Assert the file really uses this chunk index, so a case cannot
         /// silently stop exercising the structure it was written for.
         expect_index: Option<&'static str>,
@@ -489,6 +465,7 @@ mod roundtrip {
                 shuffle: false,
                 libver: LibVer::Earliest,
                 max_dims: MaxDims::Fixed,
+                storage: Storage::Chunked,
                 expect_index: None,
             }
         }
@@ -528,6 +505,11 @@ mod roundtrip {
             self
         }
 
+        fn storage(mut self, storage: Storage) -> Self {
+            self.storage = storage;
+            self
+        }
+
         /// Returns the name of the chunk index the file actually used, so
         /// callers can check that a case exercised what it meant to.
         async fn run<T>(&self) -> H5Result<&'static str>
@@ -554,14 +536,24 @@ mod roundtrip {
                     })
                     .collect();
                 let mut builder = hf.new_dataset::<T>().shape(&extents[..]);
-                if let Some(ref c) = self.chunk {
-                    builder = builder.chunk(&c[..]);
-                }
-                if self.shuffle {
-                    builder = builder.shuffle();
-                }
-                if let Some(level) = self.deflate {
-                    builder = builder.deflate(level);
+                match self.storage {
+                    Storage::Chunked => {
+                        if let Some(ref c) = self.chunk {
+                            builder = builder.chunk(&c[..]);
+                        }
+                        if self.shuffle {
+                            builder = builder.shuffle();
+                        }
+                        if let Some(level) = self.deflate {
+                            builder = builder.deflate(level);
+                        }
+                    }
+                    Storage::Contiguous => {
+                        builder = builder.layout(hdf5::plist::dataset_create::Layout::Contiguous);
+                    }
+                    Storage::Compact => {
+                        builder = builder.layout(hdf5::plist::dataset_create::Layout::Compact);
+                    }
                 }
                 let ds = builder.create("data").unwrap();
                 ds.write_raw(&data).unwrap();
@@ -576,16 +568,27 @@ mod roundtrip {
                 .to_dataset("data".to_string(), &file)
                 .await?
                 .unwrap();
-            let cds = ds.chunked()?.unwrap();
+            let cds = ds;
 
             if let Some(expected) = self.expect_index {
                 assert_eq!(
-                    cds.chunk_index_name(),
+                    cds.chunk_index_name().unwrap_or("none"),
                     expected,
                     "{:?}: expected a {expected} chunk index",
                     self.libver
                 );
             }
+            let expected_layout = match self.storage {
+                Storage::Chunked => "chunked",
+                Storage::Contiguous => "contiguous",
+                Storage::Compact => "compact",
+            };
+            assert_eq!(
+                cds.layout_name(),
+                expected_layout,
+                "{:?}: expected a {expected_layout} layout",
+                self.libver
+            );
 
             // Full read
             let result = cds.read_full::<T>(&file).await?;
@@ -617,7 +620,7 @@ mod roundtrip {
                 );
             }
 
-            Ok(cds.chunk_index_name())
+            Ok(cds.chunk_index_name().unwrap_or("none"))
         }
     }
 
@@ -738,7 +741,7 @@ mod roundtrip {
     /// exercise the error paths against it.
     async fn error_case_dataset(
         tmp: &tempfile::NamedTempFile,
-    ) -> H5Result<(ObjectStoreFile, super::ChunkedDataset)> {
+    ) -> H5Result<(ObjectStoreFile, super::Dataset)> {
         let path = tmp.path();
         {
             let hf = hdf5::File::with_options()
@@ -767,7 +770,7 @@ mod roundtrip {
             .to_dataset("data".to_string(), &file)
             .await?
             .unwrap();
-        Ok((file, ds.chunked()?.unwrap()))
+        Ok((file, ds))
     }
 
     /// Reading a u32 dataset as f64 must report a mismatch, not reinterpret
@@ -944,6 +947,165 @@ mod roundtrip {
             .map(|_| ())
     }
 
+    // -- Storage layouts --
+
+    /// Contiguous storage: one row-major run of raw data outside the object
+    /// header, with no chunk index at all.
+    #[tokio::test]
+    async fn layout_contiguous_1d() -> H5Result<()> {
+        for libver in LibVer::ALL {
+            RoundtripTest::new()
+                .shape(&[10_000])
+                .storage(Storage::Contiguous)
+                .libver(libver)
+                .run::<u32>()
+                .await
+                .unwrap_or_else(|e| panic!("{libver:?}: {e}"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn layout_contiguous_2d() -> H5Result<()> {
+        for libver in LibVer::ALL {
+            RoundtripTest::new()
+                .shape(&[64, 96])
+                .storage(Storage::Contiguous)
+                .libver(libver)
+                .run::<f64>()
+                .await
+                .unwrap_or_else(|e| panic!("{libver:?}: {e}"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn layout_contiguous_3d() -> H5Result<()> {
+        for libver in LibVer::ALL {
+            RoundtripTest::new()
+                .shape(&[7, 11, 13])
+                .storage(Storage::Contiguous)
+                .libver(libver)
+                .run::<i16>()
+                .await
+                .unwrap_or_else(|e| panic!("{libver:?}: {e}"));
+        }
+        Ok(())
+    }
+
+    /// Compact storage keeps the raw data inline in the object header, so it is
+    /// limited to roughly 64 KiB.
+    #[tokio::test]
+    async fn layout_compact_1d() -> H5Result<()> {
+        for libver in LibVer::ALL {
+            RoundtripTest::new()
+                .shape(&[500])
+                .storage(Storage::Compact)
+                .libver(libver)
+                .run::<u32>()
+                .await
+                .unwrap_or_else(|e| panic!("{libver:?}: {e}"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn layout_compact_2d() -> H5Result<()> {
+        for libver in LibVer::ALL {
+            RoundtripTest::new()
+                .shape(&[20, 30])
+                .storage(Storage::Compact)
+                .libver(libver)
+                .run::<f32>()
+                .await
+                .unwrap_or_else(|e| panic!("{libver:?}: {e}"));
+        }
+        Ok(())
+    }
+
+    /// A range read of a contiguous dataset must fetch only the enclosing byte
+    /// span, and must land on the right elements for every offset and length.
+    #[tokio::test]
+    async fn contiguous_range_reads() -> H5Result<()> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let total = 5000usize;
+        let data: Vec<u32> = (0..total as u32).collect();
+
+        {
+            let hf = LibVer::Latest.builder().create(path).unwrap();
+            let ds = hf
+                .new_dataset::<u32>()
+                .shape(&[total][..])
+                .layout(hdf5::plist::dataset_create::Layout::Contiguous)
+                .create("data")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+        }
+
+        let file = test_file_abs(path);
+        let ds = crate::open_dataset(&file, &["data"])
+            .await?
+            .expect("dataset should open");
+        assert_eq!(ds.layout_name(), "contiguous");
+        assert_eq!(ds.chunk_shape(), None);
+
+        let t = total as u64;
+        for range in [
+            0..1,
+            0..100,
+            1..2,
+            999..1001,
+            t - 1..t,
+            t - 100..t,
+            0..t,
+            // Clamped past the end, and entirely past the end.
+            t - 10..t + 50,
+            t..t + 10,
+            // Empty.
+            0..0,
+            100..100,
+        ] {
+            let got = ds
+                .read_range::<u32>(std::slice::from_ref(&range), &file)
+                .await?;
+            let start = range.start.min(t) as usize;
+            let end = range.end.min(t) as usize;
+            assert_eq!(got.shape, vec![end - start], "range {range:?}: shape");
+            assert_eq!(&got.data[..], &data[start..end], "range {range:?}: data");
+        }
+        Ok(())
+    }
+
+    /// A scalar dataset has a rank-zero dataspace and takes an empty selection.
+    #[tokio::test]
+    async fn scalar_dataset() -> H5Result<()> {
+        for libver in LibVer::ALL {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            {
+                let hf = libver.builder().create(tmp.path()).unwrap();
+                hf.new_dataset::<f64>()
+                    .shape(())
+                    .create("scalar")
+                    .unwrap()
+                    .write_raw(&[2.5f64])
+                    .unwrap();
+            }
+
+            let file = test_file_abs(tmp.path());
+            let ds = crate::open_dataset(&file, &["scalar"])
+                .await?
+                .expect("scalar dataset should open");
+            assert_eq!(ds.ndim(), 0, "{libver:?}");
+            assert!(ds.shape().is_empty(), "{libver:?}");
+
+            let got = ds.read_full::<f64>(&file).await?;
+            assert!(got.shape.is_empty(), "{libver:?}");
+            assert_eq!(got.data, vec![2.5f64], "{libver:?}");
+        }
+        Ok(())
+    }
+
     /// Fixed dimensions, no filters and early allocation select the implicit
     /// index, where chunk addresses are computed rather than stored.
     #[tokio::test]
@@ -967,10 +1129,10 @@ mod roundtrip {
         }
 
         let file = test_file_abs(path);
-        let ds = crate::open_chunked_dataset(&file, &["data"])
+        let ds = crate::open_dataset(&file, &["data"])
             .await?
             .expect("dataset should open");
-        assert_eq!(ds.chunk_index_name(), "implicit");
+        assert_eq!(ds.chunk_index_name(), Some("implicit"));
         let result = ds.read_full::<u32>(&file).await?;
         assert_eq!(&result.data[..], &data[..]);
 
@@ -1001,10 +1163,10 @@ mod roundtrip {
         }
 
         let file = test_file_abs(path);
-        let ds = crate::open_chunked_dataset(&file, &["data"])
+        let ds = crate::open_dataset(&file, &["data"])
             .await?
             .expect("dataset should open");
-        assert_eq!(ds.chunk_index_name(), "v2 btree");
+        assert_eq!(ds.chunk_index_name(), Some("v2 btree"));
         let result = ds.read_full::<u32>(&file).await?;
         assert_eq!(result.shape, shape.to_vec());
         assert_eq!(&result.data[..], &data[..]);
@@ -1074,6 +1236,25 @@ mod roundtrip {
                     .unwrap();
             }
 
+            // Non-chunked layouts, so the comparison covers those read paths too.
+            let contig = hf
+                .new_dataset::<i32>()
+                .shape(&[30, 40][..])
+                .layout(hdf5::plist::dataset_create::Layout::Contiguous)
+                .create("contiguous")
+                .unwrap();
+            contig
+                .write_raw(&(0..1200).map(|i| i - 600).collect::<Vec<i32>>())
+                .unwrap();
+
+            let compact = hf
+                .new_dataset::<u16>()
+                .shape(&[24][..])
+                .layout(hdf5::plist::dataset_create::Layout::Compact)
+                .create("compact")
+                .unwrap();
+            compact.write_raw(&(0u16..24).collect::<Vec<_>>()).unwrap();
+
             // Enough attributes that the new format stores them densely too.
             let attrs = hf
                 .new_dataset::<u8>()
@@ -1102,10 +1283,20 @@ mod roundtrip {
         let datasets = crate::list_datasets(&file).await?;
         assert_eq!(
             datasets.len(),
-            42,
-            "{libver:?}: expected 42 datasets, found {:?}",
+            44,
+            "{libver:?}: expected 44 datasets, found {:?}",
             datasets.iter().map(|d| &d.path).collect::<Vec<_>>()
         );
+
+        let layout_of = |name: &str| {
+            datasets
+                .iter()
+                .find(|d| d.path == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .layout
+        };
+        assert_eq!(layout_of("/contiguous"), "contiguous", "{libver:?}");
+        assert_eq!(layout_of("/compact"), "compact", "{libver:?}");
 
         let f = super::File::open(&file).await?;
         let obj = f
@@ -1194,6 +1385,7 @@ mod roundtrip {
 
         let mut rng = Prng(SEED);
         let mut indexes_seen: Vec<&'static str> = vec![];
+        let mut layouts_seen: Vec<Storage> = vec![];
 
         for i in 0..ITERS {
             let ndim = rng.range(1, 4) as usize; // 1, 2, or 3
@@ -1230,10 +1422,30 @@ mod roundtrip {
             };
             let unlimited = rng.bool();
 
+            // Vary the storage layout too, within what the C library allows:
+            // an unlimited dimension requires chunking, and compact storage has
+            // to fit in the object header.
+            let elem_bytes: usize = match type_idx {
+                0 | 4 => 1,
+                1 | 5 => 2,
+                2 | 6 | 8 => 4,
+                _ => 8,
+            };
+            let total_bytes: usize = shape.iter().product::<usize>() * elem_bytes;
+            let storage = match rng.range(0, 4) {
+                // A whole-dataset chunk shape is how the single-chunk index is
+                // reached, so those cases stay chunked.
+                _ if whole_chunk => Storage::Chunked,
+                0 if !unlimited => Storage::Contiguous,
+                1 if !unlimited && total_bytes <= 16 * 1024 => Storage::Compact,
+                _ => Storage::Chunked,
+            };
+
             let mut cfg = RoundtripTest::new()
                 .shape(&shape)
                 .chunk(&chunk)
-                .libver(libver);
+                .libver(libver)
+                .storage(storage);
             if let Some(level) = deflate {
                 cfg = cfg.deflate(level);
             }
@@ -1259,17 +1471,28 @@ mod roundtrip {
 
             let index = result.unwrap_or_else(|e| {
                 panic!(
-                    "iter {i}: {libver:?} shape={shape:?} chunk={chunk:?} deflate={deflate:?} \
-                     shuffle={shuffle} unlimited={unlimited} type_idx={type_idx}: {e}"
+                    "iter {i}: {libver:?} {storage:?} shape={shape:?} chunk={chunk:?} \
+                     deflate={deflate:?} shuffle={shuffle} unlimited={unlimited} \
+                     type_idx={type_idx}: {e}"
                 )
             });
             if !indexes_seen.contains(&index) {
                 indexes_seen.push(index);
             }
+            if !layouts_seen.contains(&storage) {
+                layouts_seen.push(storage);
+            }
         }
 
         indexes_seen.sort_unstable();
         println!("chunk indexes exercised: {indexes_seen:?}");
+        println!("storage layouts exercised: {layouts_seen:?}");
+        for expected in [Storage::Chunked, Storage::Contiguous, Storage::Compact] {
+            assert!(
+                layouts_seen.contains(&expected),
+                "fuzzer never produced {expected:?} storage; saw {layouts_seen:?}"
+            );
+        }
         // Guard against the generator drifting into a corner that only ever
         // produces one kind of file.
         for expected in [
@@ -1353,7 +1576,7 @@ mod test {
     /// against the hdf5 C library (gold standard).
     #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     async fn compare_typed<T>(
-        cds: &super::ChunkedDataset,
+        cds: &super::Dataset,
         hdf5_ds: &hdf5::Dataset,
         path: &str,
         file: &ObjectStoreFile,
@@ -1378,7 +1601,7 @@ mod test {
     /// Dispatch to the correct typed comparison based on the HDF5 datatype.
     #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     async fn compare_dataset(
-        cds: &super::ChunkedDataset,
+        cds: &super::Dataset,
         hdf5_ds: &hdf5::Dataset,
         path: &str,
         file: &ObjectStoreFile,
@@ -1414,7 +1637,7 @@ mod test {
         path: &str,
         file: &ObjectStoreFile,
         hf: &hdf5::File,
-        datasets: &mut Vec<(String, super::ChunkedDataset)>,
+        datasets: &mut Vec<(String, super::Dataset)>,
         group_stack: &mut Vec<(super::Group, String)>,
     ) -> H5Result<()> {
         let refs = group.object_refs(file).await?;
@@ -1450,11 +1673,7 @@ mod test {
             } else if let Some(ds) = header.to_dataset(name.clone(), file).await? {
                 let hdf5_ds = hf.dataset(&child_path).unwrap();
                 compare_attrs(&ds.attributes, &hdf5_ds, &child_path);
-                if let Some(cds) = ds.chunked()? {
-                    datasets.push((child_path, cds));
-                } else {
-                    println!("  SKIP {child_path}: non-chunked layout");
-                }
+                datasets.push((child_path, ds));
             }
         }
         Ok(())
@@ -1577,7 +1796,7 @@ mod test {
         // Compare root group attributes
         compare_attrs(&f.root_group.attributes, &hf, "/");
 
-        let mut datasets: Vec<(String, super::ChunkedDataset)> = vec![];
+        let mut datasets: Vec<(String, super::Dataset)> = vec![];
         let mut group_stack: Vec<(super::Group, String)> = vec![];
 
         collect_from_group(
@@ -1617,7 +1836,7 @@ mod test {
 
     /// Helper: do a full read of a 1D chunked dataset, returning the flat data.
     async fn full_read_1d<T: H5Type>(
-        cds: &super::ChunkedDataset,
+        cds: &super::Dataset,
         file: &ObjectStoreFile,
     ) -> H5Result<Vec<T>> {
         Ok(cds.read_full::<T>(file).await?.data)
@@ -1627,7 +1846,7 @@ mod test {
     /// the ObjectStoreFile and full reference data.
     async fn setup_range_test(
         dataset_name: &str,
-    ) -> H5Result<(ObjectStoreFile, super::ChunkedDataset, Vec<u8>)> {
+    ) -> H5Result<(ObjectStoreFile, super::Dataset, Vec<u8>)> {
         let file = test_file(MOL_INFO_FILE);
         let f = super::File::open(&file).await?;
         let obj = f.root_group.find_obj(dataset_name, &file).await?.unwrap();
@@ -1636,7 +1855,7 @@ mod test {
             .to_dataset(dataset_name.to_string(), &file)
             .await?
             .unwrap();
-        let cds = ds.chunked()?.unwrap();
+        let cds = ds;
         let full_data = full_read_1d::<u8>(&cds, &file).await?;
         Ok((file, cds, full_data))
     }
@@ -1670,7 +1889,7 @@ mod test {
         require_dataset!(MOL_INFO_FILE);
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
-        let chunk_size = cds.chunks_layout.chunk_dims[0];
+        let chunk_size = cds.chunk_shape().unwrap()[0];
         println!(
             "gem_group: {total} elements, chunk_size={chunk_size}, {} chunks",
             total.div_ceil(chunk_size)
@@ -1707,7 +1926,7 @@ mod test {
         require_dataset!(MOL_INFO_FILE);
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
-        let cs = cds.chunks_layout.chunk_dims[0];
+        let cs = cds.chunk_shape().unwrap()[0];
         println!("gem_group: {total} elements, chunk_size={cs}");
 
         let ranges: Vec<std::ops::Range<u64>> = vec![
@@ -1752,7 +1971,7 @@ mod test {
         require_dataset!(MOL_INFO_FILE);
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
-        let cs = cds.chunks_layout.chunk_dims[0];
+        let cs = cds.chunk_shape().unwrap()[0];
 
         // Test power-of-two sizes and offsets
         let sizes = [
@@ -1838,11 +2057,11 @@ mod test {
             .to_dataset("barcode_corrected_reads".to_string(), &file)
             .await?
             .unwrap();
-        let cds = ds.chunked()?.unwrap();
+        let cds = ds;
 
         let full_data = full_read_1d::<u32>(&cds, &file).await?;
         let total = full_data.len() as u64;
-        let cs = cds.chunks_layout.chunk_dims[0];
+        let cs = cds.chunk_shape().unwrap()[0];
         println!(
             "barcode_corrected_reads: {total} u32 values, chunk_size={cs}, filtered={}",
             cds.filter.is_some()
@@ -1886,11 +2105,11 @@ mod test {
             .to_dataset("barcode".to_string(), &file)
             .await?
             .unwrap();
-        let cds = ds.chunked()?.unwrap();
+        let cds = ds;
 
         let full_data = full_read_1d::<u64>(&cds, &file).await?;
         let total = full_data.len() as u64;
-        let cs = cds.chunks_layout.chunk_dims[0];
+        let cs = cds.chunk_shape().unwrap()[0];
         println!("barcode: {total} u64 values, chunk_size={cs}");
 
         let ranges: Vec<std::ops::Range<u64>> =
@@ -1922,8 +2141,8 @@ mod test {
         // We do this by comparing the number of chunks that overlap with
         // the selection vs the total chunk count.
         let (file, cds, _full_data) = setup_range_test("gem_group").await?;
-        let total = cds.dataspace.dimension[0];
-        let cs = cds.chunks_layout.chunk_dims[0];
+        let total = cds.shape()[0];
+        let cs = cds.chunk_shape().unwrap()[0];
         let all_chunks = cds.collect_chunks(&file).await?;
         let total_chunks = all_chunks.len();
 
@@ -2025,14 +2244,13 @@ mod test {
         // --- pre-open datasets ---
         // gem_group: u8, ~34.7M values, unfiltered
         let gem_obj = f.root_group.find_obj("gem_group", &osf).await?.unwrap();
-        let gem_ds = gem_obj
+        let gem_cds = gem_obj
             .header
             .to_dataset("gem_group".to_string(), &osf)
             .await?
             .unwrap();
-        let gem_cds = gem_ds.chunked()?.unwrap();
         let gem_hdf5 = hf.dataset("/gem_group").unwrap();
-        let gem_total = gem_cds.dataspace.dimension[0];
+        let gem_total = gem_cds.shape()[0];
 
         // barcode_corrected_reads: u32, ~34.7M values, gzip+shuffle
         let bcr_obj = f
@@ -2040,22 +2258,20 @@ mod test {
             .find_obj("barcode_corrected_reads", &osf)
             .await?
             .unwrap();
-        let bcr_ds = bcr_obj
+        let bcr_cds = bcr_obj
             .header
             .to_dataset("barcode_corrected_reads".to_string(), &osf)
             .await?
             .unwrap();
-        let bcr_cds = bcr_ds.chunked()?.unwrap();
         let bcr_hdf5 = hf.dataset("/barcode_corrected_reads").unwrap();
 
         // barcode: u64, ~34.7M values
         let bc_obj = f.root_group.find_obj("barcode", &osf).await?.unwrap();
-        let bc_ds = bc_obj
+        let bc_cds = bc_obj
             .header
             .to_dataset("barcode".to_string(), &osf)
             .await?
             .unwrap();
-        let bc_cds = bc_ds.chunked()?.unwrap();
         let bc_hdf5 = hf.dataset("/barcode").unwrap();
 
         let mut results: Vec<BenchResult> = Vec::new();
@@ -2112,7 +2328,7 @@ mod test {
             results.push(BenchResult {
                 name: format!(
                     "Full read barcode_corrected_reads (u32, {}M, {})",
-                    bcr_cds.dataspace.dimension[0] / 1_000_000,
+                    bcr_cds.shape()[0] / 1_000_000,
                     if bcr_cds.filter.is_some() {
                         "filtered"
                     } else {
@@ -2142,7 +2358,7 @@ mod test {
             results.push(BenchResult {
                 name: format!(
                     "Full read barcode (u64, {}M, {})",
-                    bc_cds.dataspace.dimension[0] / 1_000_000,
+                    bc_cds.shape()[0] / 1_000_000,
                     if bc_cds.filter.is_some() {
                         "filtered"
                     } else {
@@ -2212,7 +2428,7 @@ mod test {
 
         // 6. Range read: 1M elements from barcode_corrected_reads (filtered)
         if false {
-            let start = bcr_cds.dataspace.dimension[0] / 2;
+            let start = bcr_cds.shape()[0] / 2;
             let end = start + 1_000_000;
             let mut h5rs_t = Vec::new();
             let mut hdf5_t = Vec::new();
@@ -2374,9 +2590,9 @@ mod test {
         {
             const ATTR_ITERS: usize = 100;
             let all_ds_attrs: Vec<(&str, &[AttributeMessage])> = vec![
-                ("gem_group", &gem_ds.attributes),
-                ("barcode_corrected_reads", &bcr_ds.attributes),
-                ("barcode", &bc_ds.attributes),
+                ("gem_group", &gem_cds.attributes),
+                ("barcode_corrected_reads", &bcr_cds.attributes),
+                ("barcode", &bc_cds.attributes),
             ];
             let total_attrs: usize = all_ds_attrs.iter().map(|(_, a)| a.len()).sum();
             if total_attrs > 0 {

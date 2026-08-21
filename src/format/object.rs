@@ -122,6 +122,35 @@ impl DataObjectHeader {
     }
 }
 
+/// Bytes the first chunk of an object header occupies on disk, read from its
+/// opening bytes alone.
+///
+/// Object headers have no fixed size — a large compact dataset or a run of
+/// attributes can push one well past any default fetch — so the reader has to
+/// learn the extent before it can fetch the whole thing.
+pub fn header_chunk_extent(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() >= 4 && &bytes[..4] == OHDR_SIGNATURE {
+        let flags = *bytes.get(5)?;
+        let mut pos = 6usize;
+        if flags & 0x20 != 0 {
+            pos += 16; // access / modification / change / birth times
+        }
+        if flags & 0x10 != 0 {
+            pos += 4; // attribute storage phase change values
+        }
+        let width = 1usize << (flags & 0x03);
+        let mut buf = [0u8; 8];
+        buf[..width].copy_from_slice(bytes.get(pos..pos + width)?);
+        // prefix, the size field itself, the message area, and the checksum
+        Some(pos as u64 + width as u64 + u64::from_le_bytes(buf) + 4)
+    } else {
+        // Version 1: version, padding, message count, reference count, then the
+        // message area size, then four bytes of padding.
+        let size = u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?) as u64;
+        Some(16 + size)
+    }
+}
+
 /// Version 1 object header prefix, before the message area.
 #[derive(BinRead, Debug)]
 #[allow(dead_code)]
@@ -565,6 +594,9 @@ pub struct DataspaceMessage {
     pub version: u8,
     pub dimensionality: u8,
     pub flags: u8,
+    /// 0 scalar, 1 simple, 2 null. Version 1 messages have no such field, so
+    /// it is derived from the dimensionality there.
+    pub dataspace_type: u8,
     pub dimension: Vec<u64>,
     pub dimension_max: Vec<u64>,
 }
@@ -582,11 +614,14 @@ impl BinRead for DataspaceMessage {
         let dimensionality = u8::read_options(reader, endian, ())?;
         let flags = u8::read_options(reader, endian, ())?;
 
-        match version {
-            // Reserved byte, then a reserved 32-bit word.
-            1 => reader.seek(std::io::SeekFrom::Current(5))?,
-            // Dataspace type byte; no other padding.
-            2 => reader.seek(std::io::SeekFrom::Current(1))?,
+        let dataspace_type = match version {
+            1 => {
+                // Reserved byte, then a reserved 32-bit word. Version 1 has no
+                // null dataspace: rank zero means scalar.
+                reader.seek(std::io::SeekFrom::Current(5))?;
+                if dimensionality == 0 { 0 } else { 1 }
+            }
+            2 => u8::read_options(reader, endian, ())?,
             v => {
                 return Err(binrw::Error::AssertFail {
                     pos,
@@ -616,6 +651,7 @@ impl BinRead for DataspaceMessage {
             version,
             dimensionality,
             flags,
+            dataspace_type,
             dimension,
             dimension_max,
         })
@@ -858,8 +894,16 @@ impl DatatypeMessage {
 }
 
 impl DataspaceMessage {
+    /// A null dataspace holds no elements at all, unlike a scalar one which
+    /// holds exactly one.
+    pub fn is_null(&self) -> bool {
+        self.dataspace_type == 2
+    }
+
     pub fn num_elements(&self) -> usize {
-        if self.dimensionality == 0 {
+        if self.is_null() {
+            0
+        } else if self.dimensionality == 0 {
             1
         } else {
             self.dimension.iter().map(|&d| d as usize).product()
