@@ -4,7 +4,7 @@ use binrw::{BinRead, BinResult, NullString};
 
 use crate::{
     Dataset, Group,
-    error::H5Result,
+    error::{H5Error, H5Result},
     format::metadata::{GroupBTreeV1, LocalHeap},
     object_store::{ObjectStoreFile, read_and_parse_args, read_metadata},
 };
@@ -78,10 +78,7 @@ impl DataObjectHeader {
             .collect()
     }
 
-    pub async fn load_continuation_messages(
-        &mut self,
-        file: &ObjectStoreFile,
-    ) -> H5Result<()> {
+    pub async fn load_continuation_messages(&mut self, file: &ObjectStoreFile) -> H5Result<()> {
         let mut new_messages = vec![];
         for m in self.messages.iter() {
             let InnerMessage::ObjectHeaderContinuation(m) = &m.inner else {
@@ -98,9 +95,7 @@ impl DataObjectHeader {
     }
 
     pub async fn to_group(&self, file: &ObjectStoreFile) -> Option<H5Result<Group>> {
-        let Some(stm) = self.symbol_table_message() else {
-            return None;
-        };
+        let stm = self.symbol_table_message()?;
 
         let attributes = self.attribute_messages().into_iter().cloned().collect();
 
@@ -121,17 +116,9 @@ impl DataObjectHeader {
     }
 
     pub fn to_dataset(&self, name: String) -> Option<Dataset> {
-        let Some(dataspace) = self.dataspace_message() else {
-            return None;
-        };
-
-        let Some(datatype) = self.datatype_message() else {
-            return None;
-        };
-
-        let Some(layout) = self.data_layout_message() else {
-            return None;
-        };
+        let dataspace = self.dataspace_message()?;
+        let datatype = self.datatype_message()?;
+        let layout = self.data_layout_message()?;
 
         Some(Dataset {
             name,
@@ -286,17 +273,20 @@ impl FloatingPointDescriptor {
 }
 
 impl DatatypeMessage {
-    pub fn element_size(&self) -> usize {
-        match &self.type_desc {
+    pub fn element_size(&self) -> H5Result<usize> {
+        Ok(match &self.type_desc {
             TypeDescriptor::FixedPoint(fp) => fp.size() as usize,
             TypeDescriptor::FloatingPoint(fp) => fp.size() as usize,
             TypeDescriptor::String(s) => s.size() as usize,
             // VL references on disk: uint32 length + uint64 heap addr + uint32 heap index = 16
             TypeDescriptor::Variable(_) => 16,
             TypeDescriptor::UnimplementedTypeClass => {
-                panic!("element_size not supported for unimplemented type class")
+                return Err(H5Error::unsupported(
+                    "datatype class (only fixed-point, floating-point, string and \
+                     variable-length are implemented)",
+                ));
             }
-        }
+        })
     }
 }
 
@@ -502,7 +492,11 @@ pub struct AttributeMessage {
     pub datatype: DatatypeMessage,
     #[br(pad_size_to = dataspace_size.next_multiple_of(8))]
     pub dataspace: DataspaceMessage,
-    #[br(count = datatype.element_size() * dataspace.num_elements())]
+    // An unsupported datatype class yields a zero-length payload rather than
+    // failing the whole object header: the enclosing HeaderMessage is
+    // `pad_size_to = data_size`, so the parser still advances correctly and
+    // only `read`/`read_strings` on this one attribute report the error.
+    #[br(count = datatype.element_size().unwrap_or(0) * dataspace.num_elements())]
     pub data: Vec<u8>,
 }
 
@@ -512,16 +506,22 @@ impl AttributeMessage {
         self.name.to_string()
     }
 
-    pub fn read<T: crate::h5type::H5Type>(&self) -> Vec<T> {
-        T::check_dtype(&self.datatype);
-        bytemuck::cast_slice(&self.data).to_vec()
+    pub fn read<T: crate::h5type::H5Type>(&self) -> H5Result<Vec<T>> {
+        T::check_dtype(&self.datatype)?;
+        Ok(bytemuck::cast_slice(&self.data).to_vec())
     }
 
-    pub fn read_strings(&self) -> Vec<String> {
+    pub fn read_strings(&self) -> H5Result<Vec<String>> {
         let TypeDescriptor::String(ref sd) = self.datatype.type_desc else {
-            panic!("read_strings called on non-string type: {:?}", self.datatype.type_desc);
+            return Err(H5Error::type_mismatch::<String>(format!(
+                "{:?}",
+                self.datatype.type_desc
+            )));
         };
         let elem_size = sd.size() as usize;
+        if elem_size == 0 {
+            return Err(H5Error::corrupt("string datatype with zero element size"));
+        }
         let num = self.dataspace.num_elements();
         self.data
             .chunks(elem_size)
@@ -540,9 +540,11 @@ impl AttributeMessage {
                         let end = chunk.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
                         &chunk[..end]
                     }
-                    p => panic!("unknown string padding type: {p}"),
+                    p => {
+                        return Err(H5Error::unsupported(format!("string padding type {p}")));
+                    }
                 };
-                String::from_utf8_lossy(trimmed).into_owned()
+                Ok(String::from_utf8_lossy(trimmed).into_owned())
             })
             .collect()
     }

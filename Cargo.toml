@@ -2,28 +2,54 @@
 name = "h5rs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.86"
+authors = ["Patrick Marks <pmarks@gmail.com>"]
+description = "Pure Rust, read-only HDF5 reader with an async, object-storage-native API"
+documentation = "https://docs.rs/h5rs"
+repository = "https://github.com/pmarks/h5rs"
+homepage = "https://github.com/pmarks/h5rs"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["hdf5", "h5", "object-store", "async", "pure-rust"]
+categories = ["science", "filesystem", "parser-implementations", "wasm"]
+exclude = [
+    "/datasets",
+    "/.github",
+    "/.claude",
+    "/.cargo",
+    "CLAUDE.md",
+]
+
+[features]
+default = []
+# Test-only: enable the differential tests that compare h5rs against the HDF5
+# C library. Pulls in `hdf5-metno`, which compiles a bundled copy of libhdf5.
+# This is not used by any non-test code path.
+hdf5-compare = ["dep:hdf5"]
 
 [dependencies]
-binrw = "0.15"
-bytemuck = "1"
-bytes = "1"
+binrw = "0.15.2"
+bytemuck = "1.25"
+bytes = "1.11"
 futures-core = "0.3"
-flate2 = { version = "1", features = ["zlib-rs"], default-features = false }
-object_store = "0.13"
+flate2 = { version = "1.1", features = ["zlib-rs"], default-features = false }
+object_store = "0.14"
 
-[profile.profiling]
-inherits = "release"
-opt-level = 3
-debug = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-hdf5 = { path = "../hdf5-rust/hdf5" }
-ndarray = "0.15"
-tempfile = "3.25.0"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Optional, test-only. Cargo has no notion of an optional dev-dependency, so
+# the gold-standard comparison library is declared here and gated behind the
+# `hdf5-compare` feature. It is never built unless that feature is enabled.
+hdf5 = { package = "hdf5-metno", version = "0.14", features = [
+    "static",
+    "zlib",
+], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 chrono = { version = "0.4", features = ["wasmbind"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+ndarray = "0.17"
+tempfile = "3.27"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 async-trait = "0.1"
@@ -31,3 +57,8 @@ futures = "0.3"
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-test = "0.3"
+
+[profile.profiling]
+inherits = "release"
+opt-level = 3
+debug = true

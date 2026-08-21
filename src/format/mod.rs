@@ -35,9 +35,18 @@ mod tests {
         }
     }
 
+    const MATRIX_FILE: &str = "datasets/gene_bc_matrix.h5";
+
     #[crate::async_test]
     async fn basic() -> H5Result<()> {
-        let file = test_file("datasets/gene_bc_matrix.h5");
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if !std::path::Path::new(MATRIX_FILE).exists() {
+                println!("SKIP: {MATRIX_FILE} not present (see README: Test data)");
+                return Ok(());
+            }
+        }
+        let file = test_file(MATRIX_FILE);
 
         let sb: SuperblockV0 = read_metadata(&file, 0).await?;
         println!("superblock: {:#?}", sb);
@@ -54,10 +63,7 @@ mod tests {
 
         let root_group_symbol_table = root_group.symbol_table_message().unwrap();
 
-        let rg = root_group
-            .to_group(&file)
-            .await
-            .unwrap()?;
+        let _rg = root_group.to_group(&file).await.unwrap()?;
 
         let root_group_btree: GroupBTreeV1 =
             read_metadata(&file, root_group_symbol_table.btree_address).await?;
@@ -74,8 +80,7 @@ mod tests {
         println!("{:#?}", symbol);
 
         let ste = &symbol.entries[0];
-        let obj: DataObjectHeader =
-            read_metadata(&file, ste.object_header_address).await?;
+        let obj: DataObjectHeader = read_metadata(&file, ste.object_header_address).await?;
         println!("{:#?}", obj);
 
         if let Some(ds) = obj.to_dataset("asdf".to_string()) {

@@ -7,8 +7,8 @@ use std::fmt;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
-use futures::stream::{self, BoxStream};
 use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use object_store::path::Path;
 use object_store::*;
 use wasm_bindgen::prelude::*;
@@ -145,6 +145,7 @@ impl ObjectStore for NodeFileSystem {
             meta,
             range,
             attributes: Attributes::new(),
+            extensions: Default::default(),
         })
     }
 

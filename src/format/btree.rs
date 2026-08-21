@@ -16,10 +16,7 @@ pub trait BTree: Sized {
 }
 
 /// Collect all leaf entries from a B-tree via async DFS (no args variant).
-pub async fn collect_btree_leaves<B>(
-    file: &ObjectStoreFile,
-    root: B,
-) -> H5Result<Vec<B::Leaf>>
+pub async fn collect_btree_leaves<B>(file: &ObjectStoreFile, root: B) -> H5Result<Vec<B::Leaf>>
 where
     B: BTree<Args = ()> + Clone + for<'a> BinRead<Args<'a> = ()>,
 {

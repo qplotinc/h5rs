@@ -74,9 +74,7 @@ impl BTree for GroupBTreeV1 {
         &self.children
     }
 
-    fn args(&self) -> Self::Args {
-        ()
-    }
+    fn args(&self) -> Self::Args {}
 
     fn node_level(&self) -> u8 {
         self.node_level
@@ -155,6 +153,9 @@ impl HasPointer for ChunkPointerV1 {
 #[br(import(dim: u8))]
 pub struct ChunkKeyV1 {
     pub chunk_size: u32,
+    /// Bitmask of filters skipped for this chunk. Parsed for completeness;
+    /// h5rs does not yet honour per-chunk filter skipping.
+    #[allow(dead_code)]
     pub filter_mask: u32,
     #[br(count = dim + 1)]
     pub offsets: Vec<u64>,
@@ -210,7 +211,9 @@ pub struct LocalHeap {
 impl LocalHeap {
     pub async fn load(&self, file: &ObjectStoreFile) -> H5Result<LoadedLocalHeap> {
         let data = fetch_exact(file, self.data_segment_address, self.data_segment_size).await?;
-        Ok(LoadedLocalHeap { data: data.to_vec() })
+        Ok(LoadedLocalHeap {
+            data: data.to_vec(),
+        })
     }
 }
 

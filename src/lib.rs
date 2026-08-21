@@ -1,6 +1,88 @@
-#![deny(unsafe_code)]
+//! A pure Rust, read-only HDF5 reader built for object storage and HTTP.
+//!
+//! h5rs parses the [HDF5 file format] directly with [`binrw`], so it needs no C
+//! library, no `libhdf5` build step, and no POSIX file handle. Every read is a
+//! ranged GET against an [`object_store`] backend, which means the same code
+//! reads a local file, an S3/GCS/Azure object, a plain HTTP URL, or — compiled
+//! to `wasm32` — a file fetched from the browser.
+//!
+//! # Getting started
+//!
+//! Point an [`ObjectStoreFile`] at your file, then list what is inside it or
+//! open a dataset by path:
+//!
+//! ```no_run
+//! use h5rs::object_store::ObjectStoreFile;
+//! use object_store::{local::LocalFileSystem, path::Path};
+//!
+//! # async fn run() -> h5rs::error::H5Result<()> {
+//! let store = LocalFileSystem::new_with_prefix("/data")?;
+//! let file = ObjectStoreFile::new(Box::new(store), Path::from("matrix.h5"));
+//!
+//! for info in h5rs::list_datasets(&file).await? {
+//!     println!("{} shape={:?} filters={:?}", info.path, info.shape, info.filters);
+//! }
+//!
+//! let ds = h5rs::open_chunked_dataset(&file, &["matrix", "data"])
+//!     .await?
+//!     .expect("dataset not found");
+//!
+//! // Read everything...
+//! let all = ds.read_full::<u32>(&file).await?;
+//! println!("{:?} -> {} values", all.shape, all.data.len());
+//!
+//! // ...or just the slice you need. Only the overlapping chunks are fetched.
+//! let slice = ds.read_range::<u32>(&[1_000..2_000], &file).await?;
+//! println!("{:?}", slice.shape);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Element types are checked against the on-disk datatype at read time via the
+//! [`H5Type`] trait, which is implemented for the fixed-width integer and float
+//! primitives. Asking for the wrong type returns [`H5Error::TypeMismatch`]
+//! rather than reinterpreting the bytes.
+//!
+//! # Errors
+//!
+//! h5rs reads files it did not write, usually over a network, so every failure
+//! mode is a returned [`H5Error`] — malformed input never panics. A file that
+//! uses a part of the format h5rs has not implemented yields
+//! [`H5Error::Unsupported`] rather than silently returning wrong data.
+//!
+//! # Format coverage
+//!
+//! h5rs implements the subset of HDF5 that files in the wild actually use — the
+//! "earliest" format bounds that `h5py` and most writers emit by default:
+//!
+//! | Area | Supported | Not yet |
+//! |---|---|---|
+//! | Superblock | v0 | v1, v2, v3 |
+//! | Group index | v1 B-tree + symbol table | v2 B-tree, fractal heap, "new-style" groups |
+//! | Object header | v1 | v2 (`OHDR`) |
+//! | Chunk index | v1 B-tree | fixed array, extensible array, single chunk |
+//! | Layout | contiguous, chunked | compact |
+//! | Filters | deflate (gzip), shuffle | szip, blosc, lzf, scale-offset |
+//! | Datatypes | fixed-point, floating-point, string, variable-length | compound, enum, array, reference |
+//!
+//! Files written with HDF5's *latest* format bounds (`H5Pset_libver_bounds`)
+//! use v2/v3 superblocks and v2 object headers, and are not readable yet. Such
+//! a file surfaces as [`H5Error::Parse`].
+//!
+//! Writing is out of scope, by design.
+//!
+//! [HDF5 file format]: https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html
+//! [`ObjectStoreFile`]: crate::object_store::ObjectStoreFile
+//! [`H5Type`]: crate::h5type::H5Type
+//! [`H5Error`]: crate::error::H5Error
+//! [`H5Error::Parse`]: crate::error::H5Error::Parse
+//! [`H5Error::TypeMismatch`]: crate::error::H5Error::TypeMismatch
+//! [`H5Error::Unsupported`]: crate::error::H5Error::Unsupported
 
-use crate::error::H5Result;
+#![deny(unsafe_code)]
+#![warn(missing_docs)]
+
+use crate::error::{H5Error, H5Result};
 use crate::format::{
     btree::collect_btree_leaves,
     metadata::{
@@ -78,7 +160,7 @@ pub async fn list_datasets(
                     crate::format::object::TypeDescriptor::FixedPoint(fp) => {
                         (false, fp.signed() != 0, fp.size() as usize)
                     }
-                    _ => (false, false, ds.datatype.element_size()),
+                    _ => (false, false, ds.datatype.element_size()?),
                 };
                 results.push(DatasetInfo {
                     path: child_path,
@@ -103,15 +185,15 @@ pub async fn open_chunked_dataset(
     file: &crate::object_store::ObjectStoreFile,
     internal_path: &[&str],
 ) -> error::H5Result<Option<ChunkedDataset>> {
-    if internal_path.is_empty() {
+    let Some((dataset_name, groups)) = internal_path.split_last() else {
         return Ok(None);
-    }
+    };
 
     let f = File::open(file).await?;
     let mut current_group = f.root_group;
 
     // Navigate through groups (all but last segment)
-    for &segment in &internal_path[..internal_path.len() - 1] {
+    for &segment in groups {
         match current_group.find_obj(segment, file).await? {
             Some(obj) => match obj.to_group(file).await? {
                 Some(g) => current_group = g,
@@ -122,7 +204,6 @@ pub async fn open_chunked_dataset(
     }
 
     // Last segment should be a dataset
-    let dataset_name = internal_path.last().unwrap();
     match current_group.find_obj(*dataset_name, file).await? {
         Some(obj) => match obj.header.to_dataset(dataset_name.to_string()) {
             Some(ds) => Ok(ds.chunked()),
@@ -144,7 +225,10 @@ impl File {
             read_metadata(file, sb.root_group_symbol_table_entry.object_header_address).await?;
         root_group.load_continuation_messages(file).await?;
 
-        let rg = root_group.to_group(file).await.unwrap()?;
+        let rg = root_group
+            .to_group(file)
+            .await
+            .ok_or_else(|| H5Error::corrupt("root object is not a group"))??;
 
         Ok(File { root_group: rg })
     }
@@ -206,7 +290,6 @@ impl Group {
     ) -> H5Result<Option<Object>> {
         let r = self.object_refs(file).await?;
         let Some((_, ste)) = r.iter().find(|(n, _)| n == name.as_ref()) else {
-            println!("didn't find object: {}", name.as_ref());
             return Ok(None);
         };
 
@@ -247,9 +330,446 @@ impl Dataset {
     }
 }
 
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "hdf5-compare"))]
+mod roundtrip {
+    use std::fmt::Debug;
+
+    use object_store::{local::LocalFileSystem, path::Path};
+
+    use crate::error::H5Result;
+    use crate::h5type::H5Type;
+    use crate::object_store::ObjectStoreFile;
+
+    fn test_file_abs(path: &std::path::Path) -> ObjectStoreFile {
+        let parent = path.parent().unwrap();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        let store = LocalFileSystem::new_with_prefix(parent).unwrap();
+        ObjectStoreFile::new(Box::new(store), Path::from(filename))
+    }
+
+    /// Trait for generating deterministic test values from a flat index.
+    trait TestValue: Sized {
+        fn from_index(i: usize) -> Self;
+    }
+
+    macro_rules! impl_test_value {
+        ($($ty:ty),*) => {
+            $(impl TestValue for $ty {
+                fn from_index(i: usize) -> Self { (i % 251) as $ty }
+            })*
+        };
+    }
+
+    impl_test_value!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
+
+    /// Extract elements from a flat row-major array at the given N-dimensional sub-range.
+    fn collect_subrange<T: Copy>(
+        data: &[T],
+        shape: &[usize],
+        ranges: &[std::ops::Range<u64>],
+    ) -> Vec<T> {
+        let ndim = shape.len();
+        let range_shape: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
+        let total: usize = range_shape.iter().product();
+
+        (0..total)
+            .map(|linear| {
+                let mut remaining = linear;
+                let mut src_linear = 0usize;
+                for d in 0..ndim {
+                    let range_stride: usize = range_shape[d + 1..].iter().product();
+                    let idx_in_range = remaining / range_stride;
+                    remaining %= range_stride;
+                    let src_dim_idx = ranges[d].start as usize + idx_in_range;
+                    let src_stride: usize = shape[d + 1..].iter().product();
+                    src_linear += src_dim_idx * src_stride;
+                }
+                data[src_linear]
+            })
+            .collect()
+    }
+
+    struct RoundtripTest {
+        shape: Vec<usize>,
+        chunk: Option<Vec<usize>>,
+        deflate: Option<u8>,
+        shuffle: bool,
+    }
+
+    impl RoundtripTest {
+        fn new() -> Self {
+            Self {
+                shape: vec![],
+                chunk: None,
+                deflate: None,
+                shuffle: false,
+            }
+        }
+
+        fn shape(mut self, s: &[usize]) -> Self {
+            self.shape = s.to_vec();
+            self
+        }
+
+        fn chunk(mut self, c: &[usize]) -> Self {
+            self.chunk = Some(c.to_vec());
+            self
+        }
+
+        fn deflate(mut self, level: u8) -> Self {
+            self.deflate = Some(level);
+            self
+        }
+
+        fn shuffle(mut self) -> Self {
+            self.shuffle = true;
+            self
+        }
+
+        async fn run<T>(&self) -> H5Result<()>
+        where
+            T: H5Type + hdf5::H5Type + TestValue + PartialEq + Debug,
+        {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let path = tmp.path();
+
+            let total: usize = self.shape.iter().product();
+            let data: Vec<T> = (0..total).map(T::from_index).collect();
+
+            // Write with the HDF5 C library.
+            //
+            // The library is pinned to the "earliest" format bounds: with its
+            // default (latest) bounds it emits a v2/v3 superblock, v2 B-trees
+            // and v2 object headers, none of which h5rs implements yet. See
+            // the "Format coverage" section of the README.
+            {
+                let hf = hdf5::File::with_options()
+                    .with_fapl(|f| {
+                        f.libver_bounds(
+                            hdf5::plist::file_access::LibraryVersion::Earliest,
+                            hdf5::plist::file_access::LibraryVersion::V18,
+                        )
+                    })
+                    .create(path)
+                    .unwrap();
+                let mut builder = hf.new_dataset::<T>().shape(&self.shape[..]);
+                if let Some(ref c) = self.chunk {
+                    builder = builder.chunk(&c[..]);
+                }
+                if self.shuffle {
+                    builder = builder.shuffle();
+                }
+                if let Some(level) = self.deflate {
+                    builder = builder.deflate(level);
+                }
+                let ds = builder.create("data").unwrap();
+                ds.write_raw(&data).unwrap();
+            }
+
+            // Read with h5rs
+            let file = test_file_abs(path);
+            let f = super::File::open(&file).await?;
+            let obj = f.root_group.find_obj("data", &file).await?.unwrap();
+            let ds = obj.header.to_dataset("data".to_string()).unwrap();
+            let cds = ds.chunked().unwrap();
+
+            // Full read
+            let result = cds.read_full::<T>(&file).await?;
+            assert_eq!(result.shape, self.shape, "shape mismatch");
+            assert_eq!(&result.data[..], &data[..], "data mismatch");
+
+            // Sub-range read (middle quarter in each dimension)
+            if total > 0 {
+                let sel: Vec<std::ops::Range<u64>> = self
+                    .shape
+                    .iter()
+                    .map(|&d| {
+                        let start = (d / 4) as u64;
+                        let end = (3 * d / 4).max(d / 4 + 1) as u64;
+                        start..end
+                    })
+                    .collect();
+
+                let range_result = cds.read_range::<T>(&sel, &file).await?;
+                let expected_shape: Vec<usize> =
+                    sel.iter().map(|r| (r.end - r.start) as usize).collect();
+                assert_eq!(range_result.shape, expected_shape, "range shape mismatch");
+
+                let expected_data = collect_subrange(&data, &self.shape, &sel);
+                assert_eq!(
+                    &range_result.data[..],
+                    &expected_data[..],
+                    "range data mismatch"
+                );
+            }
+
+            Ok(())
+        }
+    }
+
+    macro_rules! roundtrip {
+        ($name:ident, $T:ty, $builder:expr) => {
+            #[tokio::test]
+            async fn $name() -> H5Result<()> {
+                $builder.run::<$T>().await
+            }
+        };
+    }
+
+    // -- Dimensions --
+    roundtrip!(
+        dim_1d,
+        u32,
+        RoundtripTest::new().shape(&[10000]).chunk(&[1000])
+    );
+    roundtrip!(
+        dim_2d,
+        f64,
+        RoundtripTest::new().shape(&[100, 200]).chunk(&[32, 64])
+    );
+    roundtrip!(
+        dim_3d,
+        u8,
+        RoundtripTest::new().shape(&[10, 20, 30]).chunk(&[4, 8, 16])
+    );
+
+    // -- Filters --
+    roundtrip!(
+        filter_none,
+        u32,
+        RoundtripTest::new().shape(&[10000]).chunk(&[1000])
+    );
+    roundtrip!(
+        filter_deflate,
+        u32,
+        RoundtripTest::new()
+            .shape(&[10000])
+            .chunk(&[1000])
+            .deflate(1)
+    );
+    roundtrip!(
+        filter_shuffle_deflate,
+        u32,
+        RoundtripTest::new()
+            .shape(&[10000])
+            .chunk(&[1000])
+            .shuffle()
+            .deflate(1)
+    );
+
+    // -- Data types --
+    roundtrip!(
+        type_u8,
+        u8,
+        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
+    );
+    roundtrip!(
+        type_u32,
+        u32,
+        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
+    );
+    roundtrip!(
+        type_u64,
+        u64,
+        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
+    );
+    roundtrip!(
+        type_i32,
+        i32,
+        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
+    );
+    roundtrip!(
+        type_f32,
+        f32,
+        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
+    );
+    roundtrip!(
+        type_f64,
+        f64,
+        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
+    );
+
+    // -- Edge cases --
+    roundtrip!(
+        edge_partial_chunks,
+        u32,
+        RoundtripTest::new().shape(&[1003]).chunk(&[100])
+    );
+    roundtrip!(
+        edge_single_element_chunks,
+        u32,
+        RoundtripTest::new().shape(&[100]).chunk(&[1])
+    );
+    roundtrip!(
+        edge_chunk_equals_dim,
+        u32,
+        RoundtripTest::new().shape(&[50]).chunk(&[50])
+    );
+    roundtrip!(
+        edge_single_element,
+        u32,
+        RoundtripTest::new().shape(&[1]).chunk(&[1])
+    );
+
+    /// Build a small chunked u32 dataset and hand back everything needed to
+    /// exercise the error paths against it.
+    async fn error_case_dataset(
+        tmp: &tempfile::NamedTempFile,
+    ) -> H5Result<(ObjectStoreFile, super::ChunkedDataset)> {
+        let path = tmp.path();
+        {
+            let hf = hdf5::File::with_options()
+                .with_fapl(|f| {
+                    f.libver_bounds(
+                        hdf5::plist::file_access::LibraryVersion::Earliest,
+                        hdf5::plist::file_access::LibraryVersion::V18,
+                    )
+                })
+                .create(path)
+                .unwrap();
+            let ds = hf
+                .new_dataset::<u32>()
+                .shape(&[100][..])
+                .chunk(&[10][..])
+                .create("data")
+                .unwrap();
+            ds.write_raw(&(0u32..100).collect::<Vec<_>>()).unwrap();
+        }
+
+        let file = test_file_abs(path);
+        let f = super::File::open(&file).await?;
+        let obj = f.root_group.find_obj("data", &file).await?.unwrap();
+        let ds = obj.header.to_dataset("data".to_string()).unwrap();
+        Ok((file, ds.chunked().unwrap()))
+    }
+
+    /// Reading a u32 dataset as f64 must report a mismatch, not reinterpret
+    /// the bytes and not panic.
+    #[tokio::test]
+    async fn wrong_element_type_is_an_error() -> H5Result<()> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (file, cds) = error_case_dataset(&tmp).await?;
+
+        let err = cds.read_full::<f64>(&file).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::H5Error::TypeMismatch { .. }),
+            "expected TypeMismatch, got {err:?}"
+        );
+
+        // The correct type still works.
+        assert_eq!(cds.read_full::<u32>(&file).await?.data.len(), 100);
+        Ok(())
+    }
+
+    /// A selection with the wrong number of dimensions must report an error,
+    /// not trip an assertion.
+    #[tokio::test]
+    async fn bad_selection_arity_is_an_error() -> H5Result<()> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (file, cds) = error_case_dataset(&tmp).await?;
+
+        let err = cds
+            .read_range::<u32>(&[0..10, 0..10], &file)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::H5Error::InvalidSelection(_)),
+            "expected InvalidSelection, got {err:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fuzz_roundtrip() -> H5Result<()> {
+        const SEED: u64 = 1235;
+        const ITERS: usize = 20;
+
+        struct Prng(u64);
+        impl Prng {
+            fn next(&mut self) -> u64 {
+                // Knuth multiplicative LCG
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                self.0
+            }
+            fn range(&mut self, lo: u64, hi: u64) -> u64 {
+                lo + self.next() % (hi - lo)
+            }
+            fn bool(&mut self) -> bool {
+                self.next() % 2 == 0
+            }
+        }
+
+        let mut rng = Prng(SEED);
+
+        for i in 0..ITERS {
+            let ndim = rng.range(1, 4) as usize; // 1, 2, or 3
+            let max_dim: u64 = match ndim {
+                1 => 5000,
+                2 => 500,
+                _ => 50,
+            };
+            let shape: Vec<usize> = (0..ndim)
+                .map(|_| rng.range(1, max_dim + 1) as usize)
+                .collect();
+            let chunk: Vec<usize> = shape
+                .iter()
+                .map(|&d| rng.range(1, d as u64 + 1) as usize)
+                .collect();
+            let deflate = if rng.bool() { Some(1u8) } else { None };
+            let shuffle = deflate.is_some() && rng.bool();
+            let type_idx = rng.range(0, 10) as usize;
+
+            let mut cfg = RoundtripTest::new().shape(&shape).chunk(&chunk);
+            if let Some(level) = deflate {
+                cfg = cfg.deflate(level);
+            }
+            if shuffle {
+                cfg = cfg.shuffle();
+            }
+
+            let result = match type_idx {
+                0 => cfg.run::<u8>().await,
+                1 => cfg.run::<u16>().await,
+                2 => cfg.run::<u32>().await,
+                3 => cfg.run::<u64>().await,
+                4 => cfg.run::<i8>().await,
+                5 => cfg.run::<i16>().await,
+                6 => cfg.run::<i32>().await,
+                7 => cfg.run::<i64>().await,
+                8 => cfg.run::<f32>().await,
+                _ => cfg.run::<f64>().await,
+            };
+
+            result.unwrap_or_else(|e| {
+                panic!(
+                    "iter {i}: shape={shape:?} chunk={chunk:?} deflate={deflate:?} \
+                     shuffle={shuffle} type_idx={type_idx}: {e}"
+                )
+            });
+        }
+
+        Ok(())
+    }
+}
+
+/// Conditional async test attribute: `#[tokio::test]` on native, `#[wasm_bindgen_test]` on WASM.
+///
+/// Usage:
+/// ```ignore
+/// #[crate::async_test]
+/// async fn my_test() { ... }
+/// ```
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(unused_imports)]
+pub(crate) use tokio::test as async_test;
+
 #[cfg(test)]
 mod test {
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     use std::fmt::Debug;
 
     use object_store::path::Path;
@@ -259,6 +779,7 @@ mod test {
     use crate::object_store::ObjectStoreFile;
 
     const MOL_INFO_FILE: &str = "datasets/frozen_pbmc_donor_c_molecule_info.h5";
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     const MATRIX_FILE: &str = "datasets/gene_bc_matrix.h5";
 
     fn test_file(path: &str) -> ObjectStoreFile {
@@ -276,15 +797,30 @@ mod test {
         }
     }
 
+    /// Skip the enclosing test (returning `Ok(())`) when a large sample dataset
+    /// is not checked out locally. The files under `datasets/` are gigabytes and
+    /// are not distributed with the crate; see the README for how to fetch them.
+    macro_rules! require_dataset {
+        ($path:expr) => {{
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if !std::path::Path::new($path).exists() {
+                    println!("SKIP: {} not present (see README: Test data)", $path);
+                    return Ok(());
+                }
+            }
+        }};
+    }
+
     // ---- hdf5-dependent tests (native only) ----
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     use crate::format::object::{AttributeMessage, DataObjectHeader, TypeDescriptor};
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     use crate::object_store::read_metadata;
 
     /// Read all chunks of a dataset via h5rs and compare byte-for-byte
     /// against the hdf5 C library (gold standard).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     async fn compare_typed<T>(
         cds: &super::ChunkedDataset,
         hdf5_ds: &hdf5::Dataset,
@@ -309,7 +845,7 @@ mod test {
     }
 
     /// Dispatch to the correct typed comparison based on the HDF5 datatype.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     async fn compare_dataset(
         cds: &super::ChunkedDataset,
         hdf5_ds: &hdf5::Dataset,
@@ -341,7 +877,7 @@ mod test {
     }
 
     /// Walk a group's children, collecting chunked datasets and sub-groups.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     async fn collect_from_group(
         group: &super::Group,
         path: &str,
@@ -380,24 +916,24 @@ mod test {
         Ok(())
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     fn compare_attr_typed<T>(attr: &AttributeMessage, hdf5_attr: &hdf5::Attribute, path: &str)
     where
         T: H5Type + hdf5::H5Type + PartialEq + Debug,
     {
-        let ours: Vec<T> = attr.read::<T>();
+        let ours: Vec<T> = attr.read::<T>().unwrap();
         let expected: Vec<T> = hdf5_attr.read_raw::<T>().unwrap();
         assert_eq!(ours, expected, "{path}@{}: data mismatch", attr.name());
         println!("  OK {path}@{} ({} values)", attr.name(), ours.len());
     }
 
     /// FixedAscii<N> requires a compile-time size, so we dispatch via macro.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     macro_rules! compare_fixed_strings {
         ($attr:expr, $hdf5_attr:expr, $path:expr, $( $n:literal ),*) => {
-            match $attr.datatype.element_size() {
+            match $attr.datatype.element_size().unwrap() {
                 $( $n => {
-                    let ours = $attr.read_strings();
+                    let ours = $attr.read_strings().unwrap();
                     let expected: Vec<hdf5::types::FixedAscii<$n>> =
                         $hdf5_attr.read_raw().unwrap();
                     assert_eq!(
@@ -423,7 +959,7 @@ mod test {
         };
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     fn compare_attr_strings(attr: &AttributeMessage, hdf5_attr: &hdf5::Attribute, path: &str) {
         compare_fixed_strings!(
             attr, hdf5_attr, path, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
@@ -431,7 +967,7 @@ mod test {
         );
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     fn compare_attr_untyped(attr: &AttributeMessage, hdf5_attr: &hdf5::Attribute, path: &str) {
         match &attr.datatype.type_desc {
             TypeDescriptor::FixedPoint(fp) => match (fp.signed(), fp.size()) {
@@ -466,7 +1002,7 @@ mod test {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     fn compare_attrs(attrs: &[AttributeMessage], hdf5_loc: &hdf5::Location, path: &str) {
         for attr in attrs {
             let name = attr.name();
@@ -477,8 +1013,9 @@ mod test {
 
     /// Open an HDF5 file, walk all groups, and compare every chunked
     /// dataset against the hdf5 C library.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     async fn compare_file(path: &str) -> H5Result<()> {
+        require_dataset!(path);
         let file = test_file(path);
         let f = super::File::open(&file).await?;
         let hf = hdf5::File::open(path).unwrap();
@@ -512,13 +1049,13 @@ mod test {
         Ok(())
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     #[tokio::test]
     async fn mol_info_file() -> H5Result<()> {
         compare_file(MOL_INFO_FILE).await
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     #[tokio::test]
     async fn matrix_file() -> H5Result<()> {
         compare_file(MATRIX_FILE).await
@@ -572,12 +1109,13 @@ mod test {
 
     #[crate::async_test]
     async fn read_range_basic() -> H5Result<()> {
+        require_dataset!(MOL_INFO_FILE);
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
         let chunk_size = cds.chunks_layout.dimension_sizes[0] as u64;
         println!(
             "gem_group: {total} elements, chunk_size={chunk_size}, {} chunks",
-            (total + chunk_size - 1) / chunk_size
+            total.div_ceil(chunk_size)
         );
 
         let ranges: Vec<std::ops::Range<u64>> = vec![
@@ -596,7 +1134,9 @@ mod test {
         ];
 
         for range in &ranges {
-            let result = cds.read_range::<u8>(&[range.clone()], &file).await?;
+            let result = cds
+                .read_range::<u8>(std::slice::from_ref(range), &file)
+                .await?;
             assert_range_eq(&result, &full_data, range, total);
             println!("  OK read_range {range:?} ({} values)", result.data.len());
         }
@@ -606,6 +1146,7 @@ mod test {
 
     #[crate::async_test]
     async fn read_range_chunk_boundaries() -> H5Result<()> {
+        require_dataset!(MOL_INFO_FILE);
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
         let cs = cds.chunks_layout.dimension_sizes[0] as u64;
@@ -638,7 +1179,9 @@ mod test {
         ];
 
         for range in &ranges {
-            let result = cds.read_range::<u8>(&[range.clone()], &file).await?;
+            let result = cds
+                .read_range::<u8>(std::slice::from_ref(range), &file)
+                .await?;
             assert_range_eq(&result, &full_data, range, total);
             println!("  OK read_range {range:?} ({} values)", result.data.len());
         }
@@ -648,6 +1191,7 @@ mod test {
 
     #[crate::async_test]
     async fn read_range_various_sizes() -> H5Result<()> {
+        require_dataset!(MOL_INFO_FILE);
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
         let cs = cds.chunks_layout.dimension_sizes[0] as u64;
@@ -677,7 +1221,9 @@ mod test {
                     continue;
                 }
                 let range = offset..end;
-                let result = cds.read_range::<u8>(&[range.clone()], &file).await?;
+                let result = cds
+                    .read_range::<u8>(std::slice::from_ref(&range), &file)
+                    .await?;
                 assert_range_eq(&result, &full_data, &range, total);
             }
         }
@@ -691,12 +1237,15 @@ mod test {
 
     #[crate::async_test]
     async fn read_range_clamping() -> H5Result<()> {
+        require_dataset!(MOL_INFO_FILE);
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
 
         // Range extends past dataset extent — should be clamped
         let range = total - 10..total + 100;
-        let result = cds.read_range::<u8>(&[range.clone()], &file).await?;
+        let result = cds
+            .read_range::<u8>(std::slice::from_ref(&range), &file)
+            .await?;
         assert_range_eq(&result, &full_data, &range, total);
         println!(
             "  OK clamped range {range:?} → {} values (expected 10)",
@@ -705,7 +1254,9 @@ mod test {
 
         // Completely past the end
         let range = total..total + 100;
-        let result = cds.read_range::<u8>(&[range.clone()], &file).await?;
+        let result = cds
+            .read_range::<u8>(std::slice::from_ref(&range), &file)
+            .await?;
         assert_eq!(result.data.len(), 0);
         assert_eq!(result.shape, vec![0]);
         println!("  OK fully out-of-bounds range → empty");
@@ -716,6 +1267,7 @@ mod test {
     #[crate::async_test]
     async fn read_range_u32_dataset() -> H5Result<()> {
         // Test read_range on a u32 dataset (barcode_corrected_reads)
+        require_dataset!(MOL_INFO_FILE);
         let file = test_file(MOL_INFO_FILE);
         let f = super::File::open(&file).await?;
         let obj = f
@@ -745,7 +1297,9 @@ mod test {
         ];
 
         for range in &ranges {
-            let result = cds.read_range::<u32>(&[range.clone()], &file).await?;
+            let result = cds
+                .read_range::<u32>(std::slice::from_ref(range), &file)
+                .await?;
             let start = range.start as usize;
             let end = range.end.min(total) as usize;
             let expected = &full_data[start..end];
@@ -764,6 +1318,7 @@ mod test {
     #[crate::async_test]
     async fn read_range_u64_dataset() -> H5Result<()> {
         // Test read_range on a u64 dataset (barcode) to cover larger element types
+        require_dataset!(MOL_INFO_FILE);
         let file = test_file(MOL_INFO_FILE);
         let f = super::File::open(&file).await?;
         let obj = f.root_group.find_obj("barcode", &file).await?.unwrap();
@@ -779,7 +1334,9 @@ mod test {
             vec![0..50, cs - 1..cs + 1, total - 10..total, cs..cs * 2 + 7];
 
         for range in &ranges {
-            let result = cds.read_range::<u64>(&[range.clone()], &file).await?;
+            let result = cds
+                .read_range::<u64>(std::slice::from_ref(range), &file)
+                .await?;
             let start = range.start as usize;
             let end = range.end.min(total) as usize;
             let expected = &full_data[start..end];
@@ -797,6 +1354,7 @@ mod test {
 
     #[crate::async_test]
     async fn read_range_chunk_skip_count() -> H5Result<()> {
+        require_dataset!(MOL_INFO_FILE);
         // Verify that read_range skips chunks outside the selection.
         // We do this by comparing the number of chunks that overlap with
         // the selection vs the total chunk count.
@@ -820,7 +1378,9 @@ mod test {
             })
             .count();
 
-        let result = cds.read_range::<u8>(&[range.clone()], &file).await?;
+        let result = cds
+            .read_range::<u8>(std::slice::from_ref(&range), &file)
+            .await?;
         assert_eq!(result.data.len(), (end - start) as usize);
 
         println!("  range {range:?}: {overlapping} chunks needed out of {total_chunks} total");
@@ -835,14 +1395,14 @@ mod test {
 
     // ---- Performance comparison tests (native only) ----
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     fn median(times: &[std::time::Duration]) -> std::time::Duration {
         let mut sorted: Vec<_> = times.to_vec();
         sorted.sort();
         sorted[sorted.len() / 2]
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     fn fmt_duration(d: std::time::Duration) -> String {
         let ms = d.as_secs_f64() * 1000.0;
         if ms >= 1000.0 {
@@ -852,14 +1412,14 @@ mod test {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     struct BenchResult {
         name: String,
         h5rs_times: Vec<std::time::Duration>,
         hdf5_times: Vec<std::time::Duration>,
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     impl BenchResult {
         fn print(&self) {
             let h = median(&self.h5rs_times);
@@ -874,11 +1434,14 @@ mod test {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     #[tokio::test]
     #[ignore] // Run with: cargo test perf -- --ignored --nocapture
     #[allow(unused)]
+    // `&[a..b]` is a one-dimensional selection, not a mis-typed range literal.
+    #[allow(clippy::single_range_in_vec_init)]
     async fn perf() -> H5Result<()> {
+        require_dataset!(MOL_INFO_FILE);
         use std::time::Instant;
 
         const ITERS: usize = 5;
@@ -1294,361 +1857,6 @@ mod test {
         Ok(())
     }
 }
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod roundtrip {
-    use std::fmt::Debug;
-
-    use object_store::{local::LocalFileSystem, path::Path};
-
-    use crate::error::H5Result;
-    use crate::h5type::H5Type;
-    use crate::object_store::ObjectStoreFile;
-
-    fn test_file_abs(path: &std::path::Path) -> ObjectStoreFile {
-        let parent = path.parent().unwrap();
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        let store = LocalFileSystem::new_with_prefix(parent).unwrap();
-        ObjectStoreFile::new(Box::new(store), Path::from(filename))
-    }
-
-    /// Trait for generating deterministic test values from a flat index.
-    trait TestValue: Sized {
-        fn from_index(i: usize) -> Self;
-    }
-
-    macro_rules! impl_test_value {
-        ($($ty:ty),*) => {
-            $(impl TestValue for $ty {
-                fn from_index(i: usize) -> Self { (i % 251) as $ty }
-            })*
-        };
-    }
-
-    impl_test_value!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64);
-
-    /// Extract elements from a flat row-major array at the given N-dimensional sub-range.
-    fn collect_subrange<T: Copy>(
-        data: &[T],
-        shape: &[usize],
-        ranges: &[std::ops::Range<u64>],
-    ) -> Vec<T> {
-        let ndim = shape.len();
-        let range_shape: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
-        let total: usize = range_shape.iter().product();
-
-        (0..total)
-            .map(|linear| {
-                let mut remaining = linear;
-                let mut src_linear = 0usize;
-                for d in 0..ndim {
-                    let range_stride: usize = range_shape[d + 1..].iter().product();
-                    let idx_in_range = remaining / range_stride;
-                    remaining %= range_stride;
-                    let src_dim_idx = ranges[d].start as usize + idx_in_range;
-                    let src_stride: usize = shape[d + 1..].iter().product();
-                    src_linear += src_dim_idx * src_stride;
-                }
-                data[src_linear]
-            })
-            .collect()
-    }
-
-    struct RoundtripTest {
-        shape: Vec<usize>,
-        chunk: Option<Vec<usize>>,
-        deflate: Option<u8>,
-        shuffle: bool,
-    }
-
-    impl RoundtripTest {
-        fn new() -> Self {
-            Self {
-                shape: vec![],
-                chunk: None,
-                deflate: None,
-                shuffle: false,
-            }
-        }
-
-        fn shape(mut self, s: &[usize]) -> Self {
-            self.shape = s.to_vec();
-            self
-        }
-
-        fn chunk(mut self, c: &[usize]) -> Self {
-            self.chunk = Some(c.to_vec());
-            self
-        }
-
-        fn deflate(mut self, level: u8) -> Self {
-            self.deflate = Some(level);
-            self
-        }
-
-        fn shuffle(mut self) -> Self {
-            self.shuffle = true;
-            self
-        }
-
-        async fn run<T>(&self) -> H5Result<()>
-        where
-            T: H5Type + hdf5::H5Type + TestValue + PartialEq + Debug,
-        {
-            let tmp = tempfile::NamedTempFile::new().unwrap();
-            let path = tmp.path();
-
-            let total: usize = self.shape.iter().product();
-            let data: Vec<T> = (0..total).map(T::from_index).collect();
-
-            // Write with hdf5-rust
-            {
-                let hf = hdf5::File::create(path).unwrap();
-                let mut builder = hf.new_dataset::<T>().shape(&self.shape[..]);
-                if let Some(ref c) = self.chunk {
-                    builder = builder.chunk(&c[..]);
-                }
-                if self.shuffle {
-                    builder = builder.shuffle();
-                }
-                if let Some(level) = self.deflate {
-                    builder = builder.deflate(level);
-                }
-                let ds = builder.create("data").unwrap();
-                ds.write_raw(&data).unwrap();
-            }
-
-            // Read with h5rs
-            let file = test_file_abs(path);
-            let f = super::File::open(&file).await?;
-            let obj = f.root_group.find_obj("data", &file).await?.unwrap();
-            let ds = obj.header.to_dataset("data".to_string()).unwrap();
-            let cds = ds.chunked().unwrap();
-
-            // Full read
-            let result = cds.read_full::<T>(&file).await?;
-            assert_eq!(result.shape, self.shape, "shape mismatch");
-            assert_eq!(&result.data[..], &data[..], "data mismatch");
-
-            // Sub-range read (middle quarter in each dimension)
-            if total > 0 {
-                let sel: Vec<std::ops::Range<u64>> = self
-                    .shape
-                    .iter()
-                    .map(|&d| {
-                        let start = (d / 4) as u64;
-                        let end = (3 * d / 4).max(d / 4 + 1) as u64;
-                        start..end
-                    })
-                    .collect();
-
-                let range_result = cds.read_range::<T>(&sel, &file).await?;
-                let expected_shape: Vec<usize> =
-                    sel.iter().map(|r| (r.end - r.start) as usize).collect();
-                assert_eq!(range_result.shape, expected_shape, "range shape mismatch");
-
-                let expected_data = collect_subrange(&data, &self.shape, &sel);
-                assert_eq!(
-                    &range_result.data[..],
-                    &expected_data[..],
-                    "range data mismatch"
-                );
-            }
-
-            Ok(())
-        }
-    }
-
-    macro_rules! roundtrip {
-        ($name:ident, $T:ty, $builder:expr) => {
-            #[tokio::test]
-            async fn $name() -> H5Result<()> {
-                $builder.run::<$T>().await
-            }
-        };
-    }
-
-    // -- Dimensions --
-    roundtrip!(
-        dim_1d,
-        u32,
-        RoundtripTest::new().shape(&[10000]).chunk(&[1000])
-    );
-    roundtrip!(
-        dim_2d,
-        f64,
-        RoundtripTest::new().shape(&[100, 200]).chunk(&[32, 64])
-    );
-    roundtrip!(
-        dim_3d,
-        u8,
-        RoundtripTest::new().shape(&[10, 20, 30]).chunk(&[4, 8, 16])
-    );
-
-    // -- Filters --
-    roundtrip!(
-        filter_none,
-        u32,
-        RoundtripTest::new().shape(&[10000]).chunk(&[1000])
-    );
-    roundtrip!(
-        filter_deflate,
-        u32,
-        RoundtripTest::new()
-            .shape(&[10000])
-            .chunk(&[1000])
-            .deflate(1)
-    );
-    roundtrip!(
-        filter_shuffle_deflate,
-        u32,
-        RoundtripTest::new()
-            .shape(&[10000])
-            .chunk(&[1000])
-            .shuffle()
-            .deflate(1)
-    );
-
-    // -- Data types --
-    roundtrip!(
-        type_u8,
-        u8,
-        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
-    );
-    roundtrip!(
-        type_u32,
-        u32,
-        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
-    );
-    roundtrip!(
-        type_u64,
-        u64,
-        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
-    );
-    roundtrip!(
-        type_i32,
-        i32,
-        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
-    );
-    roundtrip!(
-        type_f32,
-        f32,
-        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
-    );
-    roundtrip!(
-        type_f64,
-        f64,
-        RoundtripTest::new().shape(&[5000]).chunk(&[500]).deflate(1)
-    );
-
-    // -- Edge cases --
-    roundtrip!(
-        edge_partial_chunks,
-        u32,
-        RoundtripTest::new().shape(&[1003]).chunk(&[100])
-    );
-    roundtrip!(
-        edge_single_element_chunks,
-        u32,
-        RoundtripTest::new().shape(&[100]).chunk(&[1])
-    );
-    roundtrip!(
-        edge_chunk_equals_dim,
-        u32,
-        RoundtripTest::new().shape(&[50]).chunk(&[50])
-    );
-    roundtrip!(
-        edge_single_element,
-        u32,
-        RoundtripTest::new().shape(&[1]).chunk(&[1])
-    );
-
-    #[tokio::test]
-    async fn fuzz_roundtrip() -> H5Result<()> {
-        const SEED: u64 = 1235;
-        const ITERS: usize = 20;
-
-        struct Prng(u64);
-        impl Prng {
-            fn next(&mut self) -> u64 {
-                // Knuth multiplicative LCG
-                self.0 = self
-                    .0
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                self.0
-            }
-            fn range(&mut self, lo: u64, hi: u64) -> u64 {
-                lo + self.next() % (hi - lo)
-            }
-            fn bool(&mut self) -> bool {
-                self.next() % 2 == 0
-            }
-        }
-
-        let mut rng = Prng(SEED);
-
-        for i in 0..ITERS {
-            let ndim = rng.range(1, 4) as usize; // 1, 2, or 3
-            let max_dim: u64 = match ndim {
-                1 => 5000,
-                2 => 500,
-                _ => 50,
-            };
-            let shape: Vec<usize> = (0..ndim)
-                .map(|_| rng.range(1, max_dim + 1) as usize)
-                .collect();
-            let chunk: Vec<usize> = shape
-                .iter()
-                .map(|&d| rng.range(1, d as u64 + 1) as usize)
-                .collect();
-            let deflate = if rng.bool() { Some(1u8) } else { None };
-            let shuffle = deflate.is_some() && rng.bool();
-            let type_idx = rng.range(0, 10) as usize;
-
-            let mut cfg = RoundtripTest::new().shape(&shape).chunk(&chunk);
-            if let Some(level) = deflate {
-                cfg = cfg.deflate(level);
-            }
-            if shuffle {
-                cfg = cfg.shuffle();
-            }
-
-            let result = match type_idx {
-                0 => cfg.run::<u8>().await,
-                1 => cfg.run::<u16>().await,
-                2 => cfg.run::<u32>().await,
-                3 => cfg.run::<u64>().await,
-                4 => cfg.run::<i8>().await,
-                5 => cfg.run::<i16>().await,
-                6 => cfg.run::<i32>().await,
-                7 => cfg.run::<i64>().await,
-                8 => cfg.run::<f32>().await,
-                _ => cfg.run::<f64>().await,
-            };
-
-            result.unwrap_or_else(|e| {
-                panic!(
-                    "iter {i}: shape={shape:?} chunk={chunk:?} deflate={deflate:?} \
-                     shuffle={shuffle} type_idx={type_idx}: {e}"
-                )
-            });
-        }
-
-        Ok(())
-    }
-}
-
-/// Conditional async test attribute: `#[tokio::test]` on native, `#[wasm_bindgen_test]` on WASM.
-///
-/// Usage:
-/// ```ignore
-/// #[crate::async_test]
-/// async fn my_test() { ... }
-/// ```
-#[cfg(all(test, not(target_arch = "wasm32")))]
-#[allow(unused_imports)]
-pub(crate) use tokio::test as async_test;
 
 #[cfg(all(test, target_arch = "wasm32"))]
 pub(crate) use wasm_bindgen_test::wasm_bindgen_test as async_test;
