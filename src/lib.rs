@@ -52,22 +52,25 @@
 //!
 //! # Format coverage
 //!
-//! h5rs implements the subset of HDF5 that files in the wild actually use — the
-//! "earliest" format bounds that `h5py` and most writers emit by default:
+//! h5rs reads both of the on-disk formats the HDF5 library emits: the
+//! "earliest" encoding that `h5py` and most writers produce by default, and the
+//! "latest" encoding introduced with HDF5 1.10 and selected by
+//! `H5Pset_libver_bounds`.
 //!
 //! | Area | Supported | Not yet |
 //! |---|---|---|
-//! | Superblock | v0 | v1, v2, v3 |
-//! | Group index | v1 B-tree + symbol table | v2 B-tree, fractal heap, "new-style" groups |
-//! | Object header | v1 | v2 (`OHDR`) |
-//! | Chunk index | v1 B-tree | fixed array, extensible array, single chunk |
-//! | Layout | contiguous, chunked | compact |
-//! | Filters | deflate (gzip), shuffle | szip, blosc, lzf, scale-offset |
+//! | Superblock | v0, v1, v2, v3 | non-zero base address (user block) |
+//! | Object header | v1, v2 (`OHDR`), continuation blocks | shared messages |
+//! | Group links | symbol table, compact link messages, fractal heap + v2 B-tree | soft, external and user-defined links |
+//! | Chunk index | v1 B-tree, single chunk, implicit, fixed array, extensible array, v2 B-tree | |
+//! | Data layout | chunked (message v1-v5) | contiguous, compact and virtual are listed but not read |
+//! | Filters | deflate (gzip), shuffle, per-chunk filter masks | szip, blosc, lzf, n-bit, scale-offset, fletcher32 |
 //! | Datatypes | fixed-point, floating-point, string, variable-length | compound, enum, array, reference |
+//! | Attributes | message v1-v3, compact and dense | shared datatypes and dataspaces |
 //!
-//! Files written with HDF5's *latest* format bounds (`H5Pset_libver_bounds`)
-//! use v2/v3 superblocks and v2 object headers, and are not readable yet. Such
-//! a file surfaces as [`H5Error::Parse`].
+//! Addresses and lengths must be 8 bytes wide, which is the HDF5 default;
+//! anything else is reported as unsupported rather than mis-parsed. Metadata
+//! checksums are parsed past but not verified.
 //!
 //! Writing is out of scope, by design.
 //!
@@ -85,13 +88,10 @@
 use crate::error::{H5Error, H5Result};
 use crate::format::{
     btree::collect_btree_leaves,
-    metadata::{
-        GroupBTreeV1, GroupPointerV1, GroupSymbolTableNode, LoadedLocalHeap, SuperblockV0,
-        SymbolTableEntry,
-    },
+    metadata::{GroupBTreeV1, GroupPointerV1, GroupSymbolTableNode, LoadedLocalHeap, Superblock},
     object::{
-        AttributeMessage, DataLayoutInner, DataLayoutMessage, DataLayoutV3, DataObjectHeader,
-        DataspaceMessage, DatatypeMessage, FilterMessage, LayoutInner,
+        AttributeMessage, DataLayoutMessage, DataObjectHeader, DataspaceMessage, DatatypeMessage,
+        FilterMessage, LinkMessage, LinkTarget,
     },
 };
 use crate::object_store::{ObjectStoreFile, read_metadata};
@@ -131,27 +131,23 @@ pub async fn list_datasets(
 
     while let Some((group, prefix)) = stack.pop() {
         let refs = group.object_refs(file).await?;
-        for (name, ste) in &refs {
+        for (name, address) in &refs {
             let child_path = if prefix.is_empty() {
                 format!("/{name}")
             } else {
                 format!("{prefix}/{name}")
             };
 
-            let mut header: DataObjectHeader =
-                read_metadata(file, ste.object_header_address).await?;
-            header.load_continuation_messages(file).await?;
+            let header = read_object_header(file, *address).await?;
 
-            if let Some(result) = header.to_group(file).await {
-                let g = result?;
+            if let Some(g) = header.to_group(file).await? {
                 stack.push((g, child_path));
-            } else if let Some(ds) = header.to_dataset(name.clone()) {
+            } else if let Some(ds) = header.to_dataset(name.clone(), file).await? {
                 let ndim = ds.dataspace.dimensionality as usize;
                 let shape = ds.dataspace.dimension[..ndim].to_vec();
-                let (chunk_shape, filters) = if let Some(cds) = ds.chunked() {
-                    (Some(cds.chunk_shape()), cds.filter_names())
-                } else {
-                    (None, vec![])
+                let (chunk_shape, filters) = match ds.chunked()? {
+                    Some(cds) => (Some(cds.chunk_shape()), cds.filter_names()),
+                    None => (None, vec![]),
                 };
                 let dtype_info = match &ds.datatype.type_desc {
                     crate::format::object::TypeDescriptor::FloatingPoint(fp) => {
@@ -205,12 +201,23 @@ pub async fn open_chunked_dataset(
 
     // Last segment should be a dataset
     match current_group.find_obj(*dataset_name, file).await? {
-        Some(obj) => match obj.header.to_dataset(dataset_name.to_string()) {
-            Some(ds) => Ok(ds.chunked()),
+        Some(obj) => match obj
+            .header
+            .to_dataset(dataset_name.to_string(), file)
+            .await?
+        {
+            Some(ds) => ds.chunked(),
             None => Ok(None),
         },
         None => Ok(None),
     }
+}
+
+/// Read an object header at `address` and follow its continuation blocks.
+async fn read_object_header(file: &ObjectStoreFile, address: u64) -> H5Result<DataObjectHeader> {
+    let mut header: DataObjectHeader = read_metadata(file, address).await?;
+    header.load_continuation_messages(file).await?;
+    Ok(header)
 }
 
 struct File {
@@ -219,16 +226,13 @@ struct File {
 
 impl File {
     pub async fn open(file: &ObjectStoreFile) -> H5Result<File> {
-        let sb: SuperblockV0 = read_metadata(file, 0).await?;
-
-        let mut root_group: DataObjectHeader =
-            read_metadata(file, sb.root_group_symbol_table_entry.object_header_address).await?;
-        root_group.load_continuation_messages(file).await?;
+        let sb = Superblock::read(file).await?;
+        let root_group = read_object_header(file, sb.root_group_address).await?;
 
         let rg = root_group
             .to_group(file)
-            .await
-            .ok_or_else(|| H5Error::corrupt("root object is not a group"))??;
+            .await?
+            .ok_or_else(|| H5Error::corrupt("root object is not a group"))?;
 
         Ok(File { root_group: rg })
     }
@@ -240,47 +244,77 @@ struct Object {
 
 impl Object {
     pub async fn to_group(&self, file: &ObjectStoreFile) -> H5Result<Option<Group>> {
-        match self.header.to_group(file).await {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
+        self.header.to_group(file).await
     }
 }
 
-#[allow(dead_code)]
+/// Keep only the hard links, which are the ones h5rs can follow directly.
+///
+/// Soft, external and user-defined links are skipped rather than reported as
+/// errors: a group containing one should still list its other members.
+fn hard_links(links: &[LinkMessage]) -> Vec<(String, u64)> {
+    links
+        .iter()
+        .filter_map(|l| match l.target {
+            LinkTarget::Hard(address) => Some((l.name.clone(), address)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How a group stores the links to its members.
+///
+/// Files written before HDF5 1.8 (and any file using the "earliest" format
+/// bounds) use a symbol table; newer groups store links either as messages in
+/// the group's own object header or, once there are enough of them, in a
+/// fractal heap indexed by a version 2 B-tree.
+enum GroupLinks {
+    SymbolTable {
+        btree: GroupBTreeV1,
+        heap: LoadedLocalHeap,
+    },
+    Compact(Vec<LinkMessage>),
+    Dense {
+        fractal_heap_address: u64,
+        name_btree_address: u64,
+    },
+}
+
 struct Group {
-    btree: GroupBTreeV1,
-    loaded_local_heap: LoadedLocalHeap,
+    links: GroupLinks,
+    /// Read by the differential tests, which compare every attribute against
+    /// the HDF5 C library.
+    #[allow(dead_code)]
     pub attributes: Vec<AttributeMessage>,
 }
 
 impl Group {
-    async fn object_refs(
-        &self,
-        file: &ObjectStoreFile,
-    ) -> H5Result<Vec<(String, SymbolTableEntry)>> {
-        let ptrs: Vec<GroupPointerV1> = collect_btree_leaves(file, self.btree.clone()).await?;
-
-        let mut res = vec![];
-
-        for p in ptrs {
-            let st = self.load_symbol_table(&p, file).await?;
-            for e in &st.entries {
-                let name = self.loaded_local_heap.get_string(e.link_name_offset)?;
-                let e = e.clone();
-                res.push((name, e));
+    /// Every member of this group, as `(name, object header address)`.
+    async fn object_refs(&self, file: &ObjectStoreFile) -> H5Result<Vec<(String, u64)>> {
+        match &self.links {
+            GroupLinks::SymbolTable { btree, heap } => {
+                let ptrs: Vec<GroupPointerV1> = collect_btree_leaves(file, btree.clone()).await?;
+                let mut res = vec![];
+                for p in ptrs {
+                    let st: GroupSymbolTableNode = read_metadata(file, p.child_pointer).await?;
+                    for e in &st.entries {
+                        let name = heap.get_string(e.link_name_offset)?;
+                        res.push((name, e.object_header_address));
+                    }
+                }
+                Ok(res)
+            }
+            GroupLinks::Compact(links) => Ok(hard_links(links)),
+            GroupLinks::Dense {
+                fractal_heap_address,
+                name_btree_address,
+            } => {
+                let links =
+                    format::dense::read_links(file, *fractal_heap_address, *name_btree_address)
+                        .await?;
+                Ok(hard_links(&links))
             }
         }
-
-        Ok(res)
-    }
-
-    async fn load_symbol_table(
-        &self,
-        ptr: &GroupPointerV1,
-        file: &ObjectStoreFile,
-    ) -> H5Result<GroupSymbolTableNode> {
-        read_metadata(file, ptr.child_pointer).await
     }
 
     async fn find_obj(
@@ -289,14 +323,13 @@ impl Group {
         file: &ObjectStoreFile,
     ) -> H5Result<Option<Object>> {
         let r = self.object_refs(file).await?;
-        let Some((_, ste)) = r.iter().find(|(n, _)| n == name.as_ref()) else {
+        let Some((_, address)) = r.iter().find(|(n, _)| n == name.as_ref()) else {
             return Ok(None);
         };
 
-        let mut header: DataObjectHeader = read_metadata(file, ste.object_header_address).await?;
-        header.load_continuation_messages(file).await?;
-
-        Ok(Some(Object { header }))
+        Ok(Some(Object {
+            header: read_object_header(file, *address).await?,
+        }))
     }
 }
 
@@ -311,22 +344,27 @@ struct Dataset {
 }
 
 impl Dataset {
-    pub fn chunked(&self) -> Option<chunked::ChunkedDataset> {
-        let DataLayoutInner::V3(DataLayoutV3 {
-            layout_inner: LayoutInner::Chunked(chunk),
-            ..
-        }) = self.layout.inner.clone()
-        else {
-            return None;
+    /// This dataset as a [`ChunkedDataset`], or `None` if it is not chunked.
+    pub fn chunked(&self) -> H5Result<Option<chunked::ChunkedDataset>> {
+        let Some(chunk) = self.layout.chunked() else {
+            return Ok(None);
         };
 
-        Some(chunked::ChunkedDataset {
+        let ndim = self.dataspace.dimensionality as usize;
+        if chunk.ndim() != ndim {
+            return Err(H5Error::corrupt(format!(
+                "chunk layout has {} dimensions but the dataspace has {ndim}",
+                chunk.ndim()
+            )));
+        }
+
+        Ok(Some(chunked::ChunkedDataset {
             name: self.name.clone(),
             dataspace: self.dataspace.clone(),
             datatype: self.datatype.clone(),
             filter: self.filter.clone(),
-            chunks_layout: chunk,
-        })
+            chunks_layout: chunk.clone(),
+        }))
     }
 }
 
@@ -389,11 +427,57 @@ mod roundtrip {
             .collect()
     }
 
+    /// Which on-disk format the HDF5 C library should write.
+    ///
+    /// The two bounds produce genuinely different files: `Earliest` gives a v0
+    /// superblock, v1 object headers and v1 B-tree chunk indexes, while
+    /// `Latest` gives a v3 superblock, v2 object headers, link messages and one
+    /// of the newer chunk indexes. Every round-trip case runs against both.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum LibVer {
+        Earliest,
+        Latest,
+    }
+
+    impl LibVer {
+        pub(crate) const ALL: [LibVer; 2] = [LibVer::Earliest, LibVer::Latest];
+
+        /// A file builder pinned to these format bounds.
+        pub(crate) fn builder(self) -> hdf5::FileBuilder {
+            use hdf5::plist::file_access::LibraryVersion as V;
+            let mut b = hdf5::File::with_options();
+            match self {
+                LibVer::Earliest => {
+                    b.with_fapl(|f| f.libver_bounds(V::Earliest, V::V18));
+                }
+                LibVer::Latest => {
+                    b.with_fapl(|f| f.libver_bounds(V::latest(), V::latest()));
+                }
+            }
+            b
+        }
+    }
+
+    /// Maximum extent of one dimension, used to force an unlimited dimension
+    /// and so exercise the extensible array chunk index.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MaxDims {
+        /// Maximum equals the current extent.
+        Fixed,
+        /// The outermost dimension is unlimited.
+        UnlimitedFirst,
+    }
+
     struct RoundtripTest {
         shape: Vec<usize>,
         chunk: Option<Vec<usize>>,
         deflate: Option<u8>,
         shuffle: bool,
+        libver: LibVer,
+        max_dims: MaxDims,
+        /// Assert the file really uses this chunk index, so a case cannot
+        /// silently stop exercising the structure it was written for.
+        expect_index: Option<&'static str>,
     }
 
     impl RoundtripTest {
@@ -403,6 +487,9 @@ mod roundtrip {
                 chunk: None,
                 deflate: None,
                 shuffle: false,
+                libver: LibVer::Earliest,
+                max_dims: MaxDims::Fixed,
+                expect_index: None,
             }
         }
 
@@ -426,7 +513,24 @@ mod roundtrip {
             self
         }
 
-        async fn run<T>(&self) -> H5Result<()>
+        fn libver(mut self, libver: LibVer) -> Self {
+            self.libver = libver;
+            self
+        }
+
+        fn unlimited_first(mut self) -> Self {
+            self.max_dims = MaxDims::UnlimitedFirst;
+            self
+        }
+
+        fn expect_index(mut self, name: &'static str) -> Self {
+            self.expect_index = Some(name);
+            self
+        }
+
+        /// Returns the name of the chunk index the file actually used, so
+        /// callers can check that a case exercised what it meant to.
+        async fn run<T>(&self) -> H5Result<&'static str>
         where
             T: H5Type + hdf5::H5Type + TestValue + PartialEq + Debug,
         {
@@ -436,23 +540,20 @@ mod roundtrip {
             let total: usize = self.shape.iter().product();
             let data: Vec<T> = (0..total).map(T::from_index).collect();
 
-            // Write with the HDF5 C library.
-            //
-            // The library is pinned to the "earliest" format bounds: with its
-            // default (latest) bounds it emits a v2/v3 superblock, v2 B-trees
-            // and v2 object headers, none of which h5rs implements yet. See
-            // the "Format coverage" section of the README.
+            // Write with the HDF5 C library, in whichever on-disk format this
+            // case is exercising.
             {
-                let hf = hdf5::File::with_options()
-                    .with_fapl(|f| {
-                        f.libver_bounds(
-                            hdf5::plist::file_access::LibraryVersion::Earliest,
-                            hdf5::plist::file_access::LibraryVersion::V18,
-                        )
+                let hf = self.libver.builder().create(path).unwrap();
+                let extents: Vec<(usize, Option<usize>)> = self
+                    .shape
+                    .iter()
+                    .enumerate()
+                    .map(|(d, &n)| match self.max_dims {
+                        MaxDims::UnlimitedFirst if d == 0 => (n, None),
+                        _ => (n, Some(n)),
                     })
-                    .create(path)
-                    .unwrap();
-                let mut builder = hf.new_dataset::<T>().shape(&self.shape[..]);
+                    .collect();
+                let mut builder = hf.new_dataset::<T>().shape(&extents[..]);
                 if let Some(ref c) = self.chunk {
                     builder = builder.chunk(&c[..]);
                 }
@@ -470,8 +571,21 @@ mod roundtrip {
             let file = test_file_abs(path);
             let f = super::File::open(&file).await?;
             let obj = f.root_group.find_obj("data", &file).await?.unwrap();
-            let ds = obj.header.to_dataset("data".to_string()).unwrap();
-            let cds = ds.chunked().unwrap();
+            let ds = obj
+                .header
+                .to_dataset("data".to_string(), &file)
+                .await?
+                .unwrap();
+            let cds = ds.chunked()?.unwrap();
+
+            if let Some(expected) = self.expect_index {
+                assert_eq!(
+                    cds.chunk_index_name(),
+                    expected,
+                    "{:?}: expected a {expected} chunk index",
+                    self.libver
+                );
+            }
 
             // Full read
             let result = cds.read_full::<T>(&file).await?;
@@ -503,15 +617,24 @@ mod roundtrip {
                 );
             }
 
-            Ok(())
+            Ok(cds.chunk_index_name())
         }
     }
 
+    /// Run a case against both on-disk formats, so a case can only pass if
+    /// h5rs reads the old and the new encoding identically.
     macro_rules! roundtrip {
         ($name:ident, $T:ty, $builder:expr) => {
             #[tokio::test]
             async fn $name() -> H5Result<()> {
-                $builder.run::<$T>().await
+                for libver in LibVer::ALL {
+                    $builder
+                        .libver(libver)
+                        .run::<$T>()
+                        .await
+                        .unwrap_or_else(|e| panic!("{libver:?}: {e}"));
+                }
+                Ok(())
             }
         };
     }
@@ -639,8 +762,12 @@ mod roundtrip {
         let file = test_file_abs(path);
         let f = super::File::open(&file).await?;
         let obj = f.root_group.find_obj("data", &file).await?.unwrap();
-        let ds = obj.header.to_dataset("data".to_string()).unwrap();
-        Ok((file, ds.chunked().unwrap()))
+        let ds = obj
+            .header
+            .to_dataset("data".to_string(), &file)
+            .await?
+            .unwrap();
+        Ok((file, ds.chunked()?.unwrap()))
     }
 
     /// Reading a u32 dataset as f64 must report a mismatch, not reinterpret
@@ -679,30 +806,394 @@ mod roundtrip {
         Ok(())
     }
 
+    // -- Chunk index structures --
+    //
+    // Which index the C library picks depends on the dataset's shape and
+    // filters, so each of these cases both writes a file with the right shape
+    // and asserts that the index it got is the one under test.
+
+    /// Only reachable in the new format; the old format always uses a v1 B-tree.
+    #[tokio::test]
+    async fn index_single_chunk() -> H5Result<()> {
+        RoundtripTest::new()
+            .shape(&[64])
+            .chunk(&[64])
+            .libver(LibVer::Earliest)
+            .expect_index("v1 btree")
+            .run::<u32>()
+            .await?;
+        RoundtripTest::new()
+            .shape(&[64])
+            .chunk(&[64])
+            .libver(LibVer::Latest)
+            .expect_index("single chunk")
+            .run::<u32>()
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn index_single_chunk_filtered() -> H5Result<()> {
+        RoundtripTest::new()
+            .shape(&[4000])
+            .chunk(&[4000])
+            .shuffle()
+            .deflate(1)
+            .libver(LibVer::Latest)
+            .expect_index("single chunk")
+            .run::<u32>()
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn index_fixed_array() -> H5Result<()> {
+        RoundtripTest::new()
+            .shape(&[10_000])
+            .chunk(&[100])
+            .libver(LibVer::Latest)
+            .expect_index("fixed array")
+            .run::<u32>()
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn index_fixed_array_filtered() -> H5Result<()> {
+        RoundtripTest::new()
+            .shape(&[10_000])
+            .chunk(&[100])
+            .shuffle()
+            .deflate(1)
+            .libver(LibVer::Latest)
+            .expect_index("fixed array")
+            .run::<u32>()
+            .await
+            .map(|_| ())
+    }
+
+    /// More than 1024 chunks, which pushes the fixed array past one data block
+    /// page and exercises the page bitmap.
+    #[tokio::test]
+    async fn index_fixed_array_paged() -> H5Result<()> {
+        RoundtripTest::new()
+            .shape(&[300_000])
+            .chunk(&[100])
+            .libver(LibVer::Latest)
+            .expect_index("fixed array")
+            .run::<u8>()
+            .await
+            .map(|_| ())
+    }
+
+    /// One unlimited dimension selects the extensible array.
+    #[tokio::test]
+    async fn index_extensible_array() -> H5Result<()> {
+        RoundtripTest::new()
+            .shape(&[10_000])
+            .chunk(&[100])
+            .unlimited_first()
+            .libver(LibVer::Latest)
+            .expect_index("extensible array")
+            .run::<u32>()
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn index_extensible_array_filtered() -> H5Result<()> {
+        RoundtripTest::new()
+            .shape(&[10_000])
+            .chunk(&[100])
+            .unlimited_first()
+            .shuffle()
+            .deflate(1)
+            .libver(LibVer::Latest)
+            .expect_index("extensible array")
+            .run::<u32>()
+            .await
+            .map(|_| ())
+    }
+
+    /// Enough chunks to reach the extensible array's secondary blocks and
+    /// paged data blocks.
+    #[tokio::test]
+    async fn index_extensible_array_deep() -> H5Result<()> {
+        RoundtripTest::new()
+            .shape(&[500_000])
+            .chunk(&[64])
+            .unlimited_first()
+            .libver(LibVer::Latest)
+            .expect_index("extensible array")
+            .run::<u8>()
+            .await
+            .map(|_| ())
+    }
+
+    /// An unlimited dimension in the old format still uses a v1 B-tree.
+    #[tokio::test]
+    async fn index_unlimited_old_format() -> H5Result<()> {
+        RoundtripTest::new()
+            .shape(&[10_000])
+            .chunk(&[100])
+            .unlimited_first()
+            .libver(LibVer::Earliest)
+            .expect_index("v1 btree")
+            .run::<u32>()
+            .await
+            .map(|_| ())
+    }
+
+    /// Fixed dimensions, no filters and early allocation select the implicit
+    /// index, where chunk addresses are computed rather than stored.
+    #[tokio::test]
+    // `&[a..b]` is a one-dimensional selection, not a mis-typed range literal.
+    #[allow(clippy::single_range_in_vec_init)]
+    async fn index_implicit() -> H5Result<()> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let data: Vec<u32> = (0..5000).collect();
+
+        {
+            let hf = LibVer::Latest.builder().create(path).unwrap();
+            let ds = hf
+                .new_dataset::<u32>()
+                .shape(&[5000][..])
+                .chunk(&[125][..])
+                .alloc_time(Some(hdf5::plist::dataset_create::AllocTime::Early))
+                .create("data")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+        }
+
+        let file = test_file_abs(path);
+        let ds = crate::open_chunked_dataset(&file, &["data"])
+            .await?
+            .expect("dataset should open");
+        assert_eq!(ds.chunk_index_name(), "implicit");
+        let result = ds.read_full::<u32>(&file).await?;
+        assert_eq!(&result.data[..], &data[..]);
+
+        // A sub-range must skip the chunks it does not need.
+        let slice = ds.read_range::<u32>(&[1000..2500], &file).await?;
+        assert_eq!(&slice.data[..], &data[1000..2500]);
+        Ok(())
+    }
+
+    /// Two unlimited dimensions select the version 2 B-tree chunk index.
+    #[tokio::test]
+    async fn index_btree_v2() -> H5Result<()> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        let shape = [200usize, 300];
+        let data: Vec<u32> = (0..shape[0] * shape[1]).map(|i| (i % 251) as u32).collect();
+
+        {
+            let hf = LibVer::Latest.builder().create(path).unwrap();
+            let extents = [(shape[0], None), (shape[1], None)];
+            let ds = hf
+                .new_dataset::<u32>()
+                .shape(&extents[..])
+                .chunk(&[16, 32][..])
+                .create("data")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+        }
+
+        let file = test_file_abs(path);
+        let ds = crate::open_chunked_dataset(&file, &["data"])
+            .await?
+            .expect("dataset should open");
+        assert_eq!(ds.chunk_index_name(), "v2 btree");
+        let result = ds.read_full::<u32>(&file).await?;
+        assert_eq!(result.shape, shape.to_vec());
+        assert_eq!(&result.data[..], &data[..]);
+        Ok(())
+    }
+
+    /// Build a file exercising the structures that differ most between the two
+    /// formats — nested groups, enough links to force dense link storage,
+    /// enough attributes to force dense attribute storage, and a mix of
+    /// datatypes — then compare every dataset and attribute against the C
+    /// library.
+    async fn structural_roundtrip(libver: LibVer) -> H5Result<()> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+
+        {
+            let hf = libver.builder().create(path).unwrap();
+
+            // Root attributes, including a fixed-length string.
+            hf.new_attr::<u32>()
+                .shape(&[3][..])
+                .create("root_nums")
+                .unwrap()
+                .write_raw(&[7u32, 8, 9])
+                .unwrap();
+            let label = hf
+                .new_attr::<hdf5::types::FixedAscii<16>>()
+                .shape(&[1][..])
+                .create("root_label")
+                .unwrap();
+            label
+                .write_raw(&[hdf5::types::FixedAscii::<16>::from_ascii(b"h5rs").unwrap()])
+                .unwrap();
+
+            // A nested group holding a chunked, filtered dataset with its own
+            // attributes.
+            let grp = hf.create_group("nested").unwrap();
+            let sub = grp.create_group("deeper").unwrap();
+            let ds = sub
+                .new_dataset::<f64>()
+                .shape(&[40, 50][..])
+                .chunk(&[8, 16][..])
+                .shuffle()
+                .deflate(1)
+                .create("values")
+                .unwrap();
+            let values: Vec<f64> = (0..2000).map(|i| i as f64 * 0.5).collect();
+            ds.write_raw(&values).unwrap();
+            ds.new_attr::<i64>()
+                .shape(&[2][..])
+                .create("range")
+                .unwrap()
+                .write_raw(&[-5i64, 5])
+                .unwrap();
+
+            // Enough links in one group that the new format switches from
+            // compact link messages to a fractal heap indexed by a v2 B-tree.
+            let many = hf.create_group("many_links").unwrap();
+            for i in 0..40 {
+                let d = many
+                    .new_dataset::<u16>()
+                    .shape(&[8][..])
+                    .chunk(&[8][..])
+                    .create(format!("item{i:03}").as_str())
+                    .unwrap();
+                d.write_raw(&(0u16..8).map(|v| v + i as u16).collect::<Vec<_>>())
+                    .unwrap();
+            }
+
+            // Enough attributes that the new format stores them densely too.
+            let attrs = hf
+                .new_dataset::<u8>()
+                .shape(&[16][..])
+                .chunk(&[16][..])
+                .create("many_attrs")
+                .unwrap();
+            attrs.write_raw(&(0u8..16).collect::<Vec<_>>()).unwrap();
+            for i in 0..40 {
+                attrs
+                    .new_attr::<u32>()
+                    .shape(&[1][..])
+                    .create(format!("attr{i:03}").as_str())
+                    .unwrap()
+                    .write_raw(&[i as u32])
+                    .unwrap();
+            }
+        }
+
+        super::test::compare_object_store_file(test_file_abs(path), path).await?;
+
+        // The dense paths only carry their weight if they actually ran: 40
+        // links in one group and 40 attributes on one dataset are past the
+        // point where the new format switches to fractal heap storage.
+        let file = test_file_abs(path);
+        let datasets = crate::list_datasets(&file).await?;
+        assert_eq!(
+            datasets.len(),
+            42,
+            "{libver:?}: expected 42 datasets, found {:?}",
+            datasets.iter().map(|d| &d.path).collect::<Vec<_>>()
+        );
+
+        let f = super::File::open(&file).await?;
+        let obj = f
+            .root_group
+            .find_obj("many_attrs", &file)
+            .await?
+            .expect("many_attrs should exist");
+        let attrs = obj.header.all_attributes(&file).await?;
+        assert_eq!(attrs.len(), 40, "{libver:?}: expected 40 attributes");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn structural_old_format() -> H5Result<()> {
+        structural_roundtrip(LibVer::Earliest).await
+    }
+
+    #[tokio::test]
+    async fn structural_new_format() -> H5Result<()> {
+        structural_roundtrip(LibVer::Latest).await
+    }
+
+    /// The two formats must present the same tree to callers.
+    #[tokio::test]
+    async fn both_formats_list_the_same_datasets() -> H5Result<()> {
+        let mut listings = vec![];
+        let mut files = vec![];
+        for libver in LibVer::ALL {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            {
+                let hf = libver.builder().create(tmp.path()).unwrap();
+                let grp = hf.create_group("g").unwrap();
+                for i in 0..30 {
+                    let d = grp
+                        .new_dataset::<u32>()
+                        .shape(&[100][..])
+                        .chunk(&[10][..])
+                        .create(format!("d{i:02}").as_str())
+                        .unwrap();
+                    d.write_raw(&(0u32..100).collect::<Vec<_>>()).unwrap();
+                }
+            }
+            let file = test_file_abs(tmp.path());
+            let mut paths: Vec<String> = crate::list_datasets(&file)
+                .await?
+                .into_iter()
+                .map(|d| format!("{} {:?} {:?}", d.path, d.shape, d.chunk_shape))
+                .collect();
+            paths.sort();
+            listings.push(paths);
+            files.push(tmp);
+        }
+        assert_eq!(listings[0], listings[1], "listings differ between formats");
+        assert_eq!(listings[0].len(), 30);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn fuzz_roundtrip() -> H5Result<()> {
         const SEED: u64 = 1235;
-        const ITERS: usize = 20;
+        const ITERS: usize = 60;
 
         struct Prng(u64);
         impl Prng {
             fn next(&mut self) -> u64 {
-                // Knuth multiplicative LCG
+                // Knuth multiplicative LCG, then a murmur3 finalizer. The raw
+                // low bits of an LCG have very short periods — bit 0 simply
+                // alternates — which would lock the choices below together.
                 self.0 = self
                     .0
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
-                self.0
+                let mut x = self.0;
+                x = (x ^ (x >> 33)).wrapping_mul(0xff51afd7ed558ccd);
+                x = (x ^ (x >> 33)).wrapping_mul(0xc4ceb9fe1a85ec53);
+                x ^ (x >> 33)
             }
             fn range(&mut self, lo: u64, hi: u64) -> u64 {
                 lo + self.next() % (hi - lo)
             }
             fn bool(&mut self) -> bool {
-                self.next() % 2 == 0
+                self.next() & 1 == 0
             }
         }
 
         let mut rng = Prng(SEED);
+        let mut indexes_seen: Vec<&'static str> = vec![];
 
         for i in 0..ITERS {
             let ndim = rng.range(1, 4) as usize; // 1, 2, or 3
@@ -714,20 +1205,43 @@ mod roundtrip {
             let shape: Vec<usize> = (0..ndim)
                 .map(|_| rng.range(1, max_dim + 1) as usize)
                 .collect();
+            // One case in eight makes the chunk cover the whole dataset, which
+            // is what selects the single-chunk index in the new format.
+            let whole_chunk = rng.range(0, 8) == 0;
             let chunk: Vec<usize> = shape
                 .iter()
-                .map(|&d| rng.range(1, d as u64 + 1) as usize)
+                .map(|&d| {
+                    if whole_chunk {
+                        d
+                    } else {
+                        rng.range(1, d as u64 + 1) as usize
+                    }
+                })
                 .collect();
             let deflate = if rng.bool() { Some(1u8) } else { None };
             let shuffle = deflate.is_some() && rng.bool();
             let type_idx = rng.range(0, 10) as usize;
+            // Vary the on-disk format and the maximum extents, so the fuzzer
+            // reaches every chunk index structure rather than just one.
+            let libver = if rng.bool() {
+                LibVer::Earliest
+            } else {
+                LibVer::Latest
+            };
+            let unlimited = rng.bool();
 
-            let mut cfg = RoundtripTest::new().shape(&shape).chunk(&chunk);
+            let mut cfg = RoundtripTest::new()
+                .shape(&shape)
+                .chunk(&chunk)
+                .libver(libver);
             if let Some(level) = deflate {
                 cfg = cfg.deflate(level);
             }
             if shuffle {
                 cfg = cfg.shuffle();
+            }
+            if unlimited {
+                cfg = cfg.unlimited_first();
             }
 
             let result = match type_idx {
@@ -743,12 +1257,31 @@ mod roundtrip {
                 _ => cfg.run::<f64>().await,
             };
 
-            result.unwrap_or_else(|e| {
+            let index = result.unwrap_or_else(|e| {
                 panic!(
-                    "iter {i}: shape={shape:?} chunk={chunk:?} deflate={deflate:?} \
-                     shuffle={shuffle} type_idx={type_idx}: {e}"
+                    "iter {i}: {libver:?} shape={shape:?} chunk={chunk:?} deflate={deflate:?} \
+                     shuffle={shuffle} unlimited={unlimited} type_idx={type_idx}: {e}"
                 )
             });
+            if !indexes_seen.contains(&index) {
+                indexes_seen.push(index);
+            }
+        }
+
+        indexes_seen.sort_unstable();
+        println!("chunk indexes exercised: {indexes_seen:?}");
+        // Guard against the generator drifting into a corner that only ever
+        // produces one kind of file.
+        for expected in [
+            "v1 btree",
+            "single chunk",
+            "fixed array",
+            "extensible array",
+        ] {
+            assert!(
+                indexes_seen.contains(&expected),
+                "fuzzer never produced a {expected} index; saw {indexes_seen:?}"
+            );
         }
 
         Ok(())
@@ -814,9 +1347,7 @@ mod test {
 
     // ---- hdf5-dependent tests (native only) ----
     #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
-    use crate::format::object::{AttributeMessage, DataObjectHeader, TypeDescriptor};
-    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
-    use crate::object_store::read_metadata;
+    use crate::format::object::{AttributeMessage, TypeDescriptor};
 
     /// Read all chunks of a dataset via h5rs and compare byte-for-byte
     /// against the hdf5 C library (gold standard).
@@ -887,26 +1418,39 @@ mod test {
         group_stack: &mut Vec<(super::Group, String)>,
     ) -> H5Result<()> {
         let refs = group.object_refs(file).await?;
-        for (name, ste) in &refs {
+
+        // Check that h5rs found *every* member, not just that the ones it found
+        // are correct — otherwise a group whose links h5rs failed to read would
+        // silently pass as an empty group.
+        let expected = if path == "/" {
+            hf.len()
+        } else {
+            hf.group(path).unwrap().len()
+        };
+        assert_eq!(
+            refs.len() as u64,
+            expected,
+            "{path}: h5rs found {} members, the C library reports {expected}",
+            refs.len()
+        );
+
+        for (name, address) in &refs {
             let child_path = if path == "/" {
                 format!("/{name}")
             } else {
                 format!("{path}/{name}")
             };
 
-            let mut header: DataObjectHeader =
-                read_metadata(file, ste.object_header_address).await?;
-            header.load_continuation_messages(file).await?;
+            let header = super::read_object_header(file, *address).await?;
 
-            if let Some(result) = header.to_group(file).await {
-                let g = result?;
+            if let Some(g) = header.to_group(file).await? {
                 let hdf5_group = hf.group(&child_path).unwrap();
                 compare_attrs(&g.attributes, &hdf5_group, &child_path);
                 group_stack.push((g, child_path));
-            } else if let Some(ds) = header.to_dataset(name.clone()) {
+            } else if let Some(ds) = header.to_dataset(name.clone(), file).await? {
                 let hdf5_ds = hf.dataset(&child_path).unwrap();
                 compare_attrs(&ds.attributes, &hdf5_ds, &child_path);
-                if let Some(cds) = ds.chunked() {
+                if let Some(cds) = ds.chunked()? {
                     datasets.push((child_path, cds));
                 } else {
                     println!("  SKIP {child_path}: non-chunked layout");
@@ -1016,9 +1560,19 @@ mod test {
     #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
     async fn compare_file(path: &str) -> H5Result<()> {
         require_dataset!(path);
-        let file = test_file(path);
+        compare_object_store_file(test_file(path), std::path::Path::new(path)).await
+    }
+
+    /// Compare every group, dataset and attribute reachable in `file` against
+    /// what the HDF5 C library reads from the same file on disk.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
+    pub(crate) async fn compare_object_store_file(
+        file: ObjectStoreFile,
+        fs_path: &std::path::Path,
+    ) -> H5Result<()> {
+        let path = fs_path.display().to_string();
         let f = super::File::open(&file).await?;
-        let hf = hdf5::File::open(path).unwrap();
+        let hf = hdf5::File::open(fs_path).unwrap();
 
         // Compare root group attributes
         compare_attrs(&f.root_group.attributes, &hf, "/");
@@ -1077,8 +1631,12 @@ mod test {
         let file = test_file(MOL_INFO_FILE);
         let f = super::File::open(&file).await?;
         let obj = f.root_group.find_obj(dataset_name, &file).await?.unwrap();
-        let ds = obj.header.to_dataset(dataset_name.to_string()).unwrap();
-        let cds = ds.chunked().unwrap();
+        let ds = obj
+            .header
+            .to_dataset(dataset_name.to_string(), &file)
+            .await?
+            .unwrap();
+        let cds = ds.chunked()?.unwrap();
         let full_data = full_read_1d::<u8>(&cds, &file).await?;
         Ok((file, cds, full_data))
     }
@@ -1112,7 +1670,7 @@ mod test {
         require_dataset!(MOL_INFO_FILE);
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
-        let chunk_size = cds.chunks_layout.dimension_sizes[0] as u64;
+        let chunk_size = cds.chunks_layout.chunk_dims[0];
         println!(
             "gem_group: {total} elements, chunk_size={chunk_size}, {} chunks",
             total.div_ceil(chunk_size)
@@ -1149,7 +1707,7 @@ mod test {
         require_dataset!(MOL_INFO_FILE);
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
-        let cs = cds.chunks_layout.dimension_sizes[0] as u64;
+        let cs = cds.chunks_layout.chunk_dims[0];
         println!("gem_group: {total} elements, chunk_size={cs}");
 
         let ranges: Vec<std::ops::Range<u64>> = vec![
@@ -1194,7 +1752,7 @@ mod test {
         require_dataset!(MOL_INFO_FILE);
         let (file, cds, full_data) = setup_range_test("gem_group").await?;
         let total = full_data.len() as u64;
-        let cs = cds.chunks_layout.dimension_sizes[0] as u64;
+        let cs = cds.chunks_layout.chunk_dims[0];
 
         // Test power-of-two sizes and offsets
         let sizes = [
@@ -1277,13 +1835,14 @@ mod test {
             .unwrap();
         let ds = obj
             .header
-            .to_dataset("barcode_corrected_reads".to_string())
+            .to_dataset("barcode_corrected_reads".to_string(), &file)
+            .await?
             .unwrap();
-        let cds = ds.chunked().unwrap();
+        let cds = ds.chunked()?.unwrap();
 
         let full_data = full_read_1d::<u32>(&cds, &file).await?;
         let total = full_data.len() as u64;
-        let cs = cds.chunks_layout.dimension_sizes[0] as u64;
+        let cs = cds.chunks_layout.chunk_dims[0];
         println!(
             "barcode_corrected_reads: {total} u32 values, chunk_size={cs}, filtered={}",
             cds.filter.is_some()
@@ -1322,12 +1881,16 @@ mod test {
         let file = test_file(MOL_INFO_FILE);
         let f = super::File::open(&file).await?;
         let obj = f.root_group.find_obj("barcode", &file).await?.unwrap();
-        let ds = obj.header.to_dataset("barcode".to_string()).unwrap();
-        let cds = ds.chunked().unwrap();
+        let ds = obj
+            .header
+            .to_dataset("barcode".to_string(), &file)
+            .await?
+            .unwrap();
+        let cds = ds.chunked()?.unwrap();
 
         let full_data = full_read_1d::<u64>(&cds, &file).await?;
         let total = full_data.len() as u64;
-        let cs = cds.chunks_layout.dimension_sizes[0] as u64;
+        let cs = cds.chunks_layout.chunk_dims[0];
         println!("barcode: {total} u64 values, chunk_size={cs}");
 
         let ranges: Vec<std::ops::Range<u64>> =
@@ -1360,7 +1923,7 @@ mod test {
         // the selection vs the total chunk count.
         let (file, cds, _full_data) = setup_range_test("gem_group").await?;
         let total = cds.dataspace.dimension[0];
-        let cs = cds.chunks_layout.dimension_sizes[0] as u64;
+        let cs = cds.chunks_layout.chunk_dims[0];
         let all_chunks = cds.collect_chunks(&file).await?;
         let total_chunks = all_chunks.len();
 
@@ -1372,7 +1935,7 @@ mod test {
         let overlapping = all_chunks
             .iter()
             .filter(|c| {
-                let co = c.key.offsets[0];
+                let co = c.offsets[0];
                 let ce = (co + cs).min(total);
                 co < end && ce > start
             })
@@ -1462,8 +2025,12 @@ mod test {
         // --- pre-open datasets ---
         // gem_group: u8, ~34.7M values, unfiltered
         let gem_obj = f.root_group.find_obj("gem_group", &osf).await?.unwrap();
-        let gem_ds = gem_obj.header.to_dataset("gem_group".to_string()).unwrap();
-        let gem_cds = gem_ds.chunked().unwrap();
+        let gem_ds = gem_obj
+            .header
+            .to_dataset("gem_group".to_string(), &osf)
+            .await?
+            .unwrap();
+        let gem_cds = gem_ds.chunked()?.unwrap();
         let gem_hdf5 = hf.dataset("/gem_group").unwrap();
         let gem_total = gem_cds.dataspace.dimension[0];
 
@@ -1475,15 +2042,20 @@ mod test {
             .unwrap();
         let bcr_ds = bcr_obj
             .header
-            .to_dataset("barcode_corrected_reads".to_string())
+            .to_dataset("barcode_corrected_reads".to_string(), &osf)
+            .await?
             .unwrap();
-        let bcr_cds = bcr_ds.chunked().unwrap();
+        let bcr_cds = bcr_ds.chunked()?.unwrap();
         let bcr_hdf5 = hf.dataset("/barcode_corrected_reads").unwrap();
 
         // barcode: u64, ~34.7M values
         let bc_obj = f.root_group.find_obj("barcode", &osf).await?.unwrap();
-        let bc_ds = bc_obj.header.to_dataset("barcode".to_string()).unwrap();
-        let bc_cds = bc_ds.chunked().unwrap();
+        let bc_ds = bc_obj
+            .header
+            .to_dataset("barcode".to_string(), &osf)
+            .await?
+            .unwrap();
+        let bc_cds = bc_ds.chunked()?.unwrap();
         let bc_hdf5 = hf.dataset("/barcode").unwrap();
 
         let mut results: Vec<BenchResult> = Vec::new();

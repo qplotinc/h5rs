@@ -5,12 +5,11 @@ use std::ops::Range;
 
 use crate::error::{H5Error, H5Result};
 use crate::format::{
-    btree::collect_btree_leaves_args,
-    metadata::{ChunkBTreeV1, ChunkPointerV1},
-    object::{DataLayoutChunked, DataspaceMessage, DatatypeMessage, FilterMessage, FilterType},
+    chunk_index::{ChunkRecord, enumerate_chunks},
+    object::{ChunkedLayout, DataspaceMessage, DatatypeMessage, FilterMessage, FilterType},
 };
 use crate::h5type::H5Type;
-use crate::object_store::{ObjectStoreFile, fetch_exact, read_metadata_args};
+use crate::object_store::{ObjectStoreFile, fetch_exact};
 use std::io::Read;
 
 /// N-dimensional array wrapper that pairs a flat data vector with its logical shape.
@@ -98,7 +97,7 @@ pub struct ChunkedDataset {
     pub(crate) name: String,
     pub(crate) dataspace: DataspaceMessage,
     pub(crate) datatype: DatatypeMessage,
-    pub(crate) chunks_layout: DataLayoutChunked,
+    pub(crate) chunks_layout: ChunkedLayout,
     pub(crate) filter: Option<FilterMessage>,
 }
 
@@ -125,6 +124,11 @@ impl ChunkedDataset {
         self.dataspace.dimensionality as usize
     }
 
+    /// Dataset extent along each dimension.
+    fn dataset_dims(&self) -> &[u64] {
+        &self.dataspace.dimension[..self.ndim()]
+    }
+
     /// Length of each dataset dimension, outermost first.
     pub fn shape(&self) -> Vec<u64> {
         self.dataspace.dimension[..self.ndim()].to_vec()
@@ -132,10 +136,22 @@ impl ChunkedDataset {
 
     /// Length of each chunk dimension, outermost first.
     pub fn chunk_shape(&self) -> Vec<u64> {
-        self.chunks_layout.dimension_sizes[..self.ndim()]
-            .iter()
-            .map(|&d| d as u64)
-            .collect()
+        self.chunks_layout.chunk_dims.clone()
+    }
+
+    /// Name of the structure used to locate this dataset's chunks, for
+    /// diagnostics: `"v1 btree"`, `"single chunk"`, `"implicit"`,
+    /// `"fixed array"`, `"extensible array"` or `"v2 btree"`.
+    pub fn chunk_index_name(&self) -> &'static str {
+        use crate::format::object::ChunkIndex::*;
+        match self.chunks_layout.index {
+            BTreeV1 { .. } => "v1 btree",
+            SingleChunk { .. } => "single chunk",
+            Implicit { .. } => "implicit",
+            FixedArray { .. } => "fixed array",
+            ExtensibleArray { .. } => "extensible array",
+            BTreeV2 { .. } => "v2 btree",
+        }
     }
 
     /// Returns (is_float, is_signed, byte_size) for the dataset's scalar type.
@@ -169,13 +185,80 @@ impl ChunkedDataset {
         Ok(())
     }
 
+    /// Undo the filter pipeline for one chunk.
+    ///
+    /// Filters are applied in order on write, so they are undone in reverse.
+    /// A chunk whose data a filter would have grown is stored with that filter
+    /// skipped and its bit set in the chunk's filter mask, so the mask has to be
+    /// honoured or such a chunk decodes to garbage.
+    ///
+    /// Returns `None` when no filter actually ran, letting the caller use the
+    /// fetched bytes without copying them.
+    fn decode_filters(
+        &self,
+        c: &ChunkRecord,
+        stored: &[u8],
+        uncompressed_bytes: usize,
+    ) -> H5Result<Option<Vec<u8>>> {
+        let Some(pipeline) = &self.filter else {
+            return Ok(None);
+        };
+
+        let mut decoded: Option<Vec<u8>> = None;
+        for (i, fd) in pipeline.filters.iter().enumerate().rev() {
+            if c.filter_mask & (1u32 << i) != 0 {
+                continue;
+            }
+            let input: &[u8] = decoded.as_deref().unwrap_or(stored);
+            decoded = match fd.filter_type {
+                FilterType::None => continue,
+                FilterType::Deflate => {
+                    let mut out = Vec::with_capacity(uncompressed_bytes);
+                    let mut decoder = flate2::read::ZlibDecoder::new(input);
+                    decoder
+                        .read_to_end(&mut out)
+                        .map_err(|e| binrw::Error::Custom {
+                            pos: c.address,
+                            err: Box::new(e),
+                        })?;
+                    Some(out)
+                }
+                FilterType::Shuffle => Some(self.unshuffle(input)?),
+                // check_filters_supported rejects everything else up front.
+                ref other => {
+                    return Err(H5Error::unsupported(format!("{other:?} filter")));
+                }
+            };
+        }
+        Ok(decoded)
+    }
+
+    /// Reverse the shuffle filter, which stores all the first bytes of each
+    /// element, then all the second bytes, and so on.
+    fn unshuffle(&self, data: &[u8]) -> H5Result<Vec<u8>> {
+        let element_size = self.chunks_layout.element_size as usize;
+        if element_size == 0 {
+            return Err(H5Error::corrupt(
+                "chunk layout has no element size for the shuffle filter",
+            ));
+        }
+        let num_elements = data.len() / element_size;
+        let mut out = vec![0u8; data.len()];
+        for i in 0..num_elements {
+            for b in 0..element_size {
+                out[i * element_size + b] = data[b * num_elements + i];
+            }
+        }
+        Ok(out)
+    }
+
     /// Decode a chunk and copy the specified sub-region directly into `dst`.
     /// For unfiltered data, copies directly from the fetched bytes into `dst`
     /// with no intermediate buffer.
     #[allow(clippy::too_many_arguments)]
     async fn read_chunk_into<T: H5Type>(
         &self,
-        c: &ChunkPointerV1,
+        c: &ChunkRecord,
         file: &ObjectStoreFile,
         chunk_shape: &[usize],
         src_start: &[usize],
@@ -189,19 +272,14 @@ impl ChunkedDataset {
         if self.filter.is_none() {
             // Unfiltered: fetch bytes and copy sub-region directly into dst.
             // No intermediate Vec<T> needed.
-            let uncompressed_bytes: usize = self
-                .chunks_layout
-                .dimension_sizes
-                .iter()
-                .map(|&d| d as usize)
-                .product();
-            if uncompressed_bytes != c.key.chunk_size as usize {
+            let uncompressed_bytes = self.chunks_layout.chunk_bytes() as usize;
+            if uncompressed_bytes != c.size as usize {
                 return Err(H5Error::corrupt(format!(
                     "unfiltered chunk at {} records {} bytes but its layout implies {}",
-                    c.child_pointer, c.key.chunk_size, uncompressed_bytes
+                    c.address, c.size, uncompressed_bytes
                 )));
             }
-            let bytes = fetch_exact(file, c.child_pointer, uncompressed_bytes as u64).await?;
+            let bytes = fetch_exact(file, c.address, uncompressed_bytes as u64).await?;
 
             let src_strides = row_major_strides(chunk_shape);
             let dst_strides = row_major_strides(dst_shape);
@@ -217,66 +295,27 @@ impl ChunkedDataset {
                 0,
             );
         } else {
-            // Filtered: decompress into a temp buffer, then copy sub-region
-            let uncompressed_bytes: usize = self
-                .chunks_layout
-                .dimension_sizes
-                .iter()
-                .map(|&d| d as usize)
-                .product();
+            // Filtered: run the pipeline backwards into a temp buffer, then copy
+            // the sub-region out of it.
+            let uncompressed_bytes = self.chunks_layout.chunk_bytes() as usize;
+            let stored = fetch_exact(file, c.address, c.size).await?;
+            let decoded = self.decode_filters(c, &stored, uncompressed_bytes)?;
+            let data: &[u8] = decoded.as_deref().unwrap_or(&stored);
 
-            let compressed = fetch_exact(file, c.child_pointer, c.key.chunk_size as u64).await?;
-
-            // Inflate
-            let mut data = Vec::with_capacity(uncompressed_bytes);
-            let mut decoder = flate2::read::ZlibDecoder::new(&compressed[..]);
-            decoder
-                .read_to_end(&mut data)
-                .map_err(|e| binrw::Error::Custom {
-                    pos: c.child_pointer,
-                    err: Box::new(e),
-                })?;
             if data.len() != uncompressed_bytes {
                 return Err(H5Error::corrupt(format!(
-                    "chunk at {} inflated to {} bytes, expected {}",
-                    c.child_pointer,
+                    "chunk at {} decoded to {} bytes, expected {}",
+                    c.address,
                     data.len(),
                     uncompressed_bytes
                 )));
-            }
-
-            // Un-shuffle if needed
-            if self.filter.as_ref().is_some_and(|f| {
-                f.filters
-                    .iter()
-                    .any(|fd| matches!(fd.filter_type, FilterType::Shuffle))
-            }) {
-                // For a chunked layout the trailing "dimension size" is the
-                // element size in bytes, not a chunk extent.
-                let element_size = self
-                    .chunks_layout
-                    .dimension_sizes
-                    .last()
-                    .map(|&d| d as usize)
-                    .filter(|&d| d > 0)
-                    .ok_or_else(|| {
-                        H5Error::corrupt("chunk layout has no element size for shuffle filter")
-                    })?;
-                let num_elements = uncompressed_bytes / element_size;
-                let mut unshuffled = vec![0u8; uncompressed_bytes];
-                for i in 0..num_elements {
-                    for b in 0..element_size {
-                        unshuffled[i * element_size + b] = data[b * num_elements + i];
-                    }
-                }
-                data = unshuffled;
             }
 
             // Copy sub-region from decompressed bytes directly into dst
             let src_strides = row_major_strides(chunk_shape);
             let dst_strides = row_major_strides(dst_shape);
             copy_region_inner(
-                &data,
+                data,
                 elem_size,
                 &src_strides,
                 src_start,
@@ -322,7 +361,9 @@ impl ChunkedDataset {
         T::check_dtype(&self.datatype)?;
 
         let dataset_dims: &[u64] = &self.dataspace.dimension[..ndim];
-        let chunk_dims: Vec<usize> = self.chunks_layout.dimension_sizes[..ndim]
+        let chunk_dims: Vec<usize> = self
+            .chunks_layout
+            .chunk_dims
             .iter()
             .map(|&d| d as usize)
             .collect();
@@ -350,7 +391,7 @@ impl ChunkedDataset {
         let all_chunks = self.collect_chunks(file).await?;
 
         for chunk_ptr in &all_chunks {
-            let chunk_offset: &[u64] = &chunk_ptr.key.offsets[..ndim];
+            let chunk_offset: &[u64] = &chunk_ptr.offsets;
 
             // Compute intersection of chunk region with selection (in global coords),
             // clamping chunk extent to the dataset boundary for edge chunks.
@@ -403,14 +444,7 @@ impl ChunkedDataset {
     pub(crate) async fn collect_chunks(
         &self,
         file: &ObjectStoreFile,
-    ) -> H5Result<Vec<ChunkPointerV1>> {
-        let btree: ChunkBTreeV1 = read_metadata_args(
-            file,
-            self.chunks_layout.address,
-            (self.dataspace.dimensionality,),
-        )
-        .await?;
-
-        collect_btree_leaves_args(file, btree).await
+    ) -> H5Result<Vec<ChunkRecord>> {
+        enumerate_chunks(file, &self.chunks_layout, self.dataset_dims()).await
     }
 }

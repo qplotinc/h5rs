@@ -12,6 +12,7 @@ cargo test -- --nocapture              # Show println output
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build --target wasm32-unknown-unknown
+cargo check --target wasm32-unknown-unknown --lib --tests   # examples are native-only
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint, tests on Linux/macOS/Windows, the
@@ -47,7 +48,11 @@ The official HDF5 file format spec is available at: https://support.hdfgroup.org
 - **`src/lib.rs`** — High-level read path. `File`, `Group`, `Object` and `Dataset` are crate-private; the public API is `list_datasets`, `open_chunked_dataset`, `DatasetInfo`, plus `ChunkedDataset`/`NdArray` re-exported from `chunked`. Keep the public surface small — everything public needs a doc comment (`#![warn(missing_docs)]` is on).
 - **`src/format/metadata.rs`** — HDF5 superblock, v1 B-trees (group and chunk), symbol tables, local heap, type descriptors (FixedPoint, FloatingPoint, String, VariableLength).
 - **`src/format/object.rs`** — Object headers and header messages: dataspace, datatype, data layout (compact/contiguous/chunked), filter pipeline. Custom `binrw` parsers for variable-length message lists.
-- **`src/format/btree.rs`** — Generic async B-tree traversal (`collect_btree_leaves`, `collect_btree_leaves_args`), abstracted over node types via the `BTree` and `HasPointer` traits.
+- **`src/format/btree.rs`** — Generic async version 1 B-tree traversal (`collect_btree_leaves`, `collect_btree_leaves_args`), abstracted over node types via the `BTree` and `HasPointer` traits.
+- **`src/format/btree2.rs`** — Version 2 B-trees. Only enumeration is implemented (never search by key), which is all the read path needs. The node geometry — the widths of the per-child record counts — has to be recomputed exactly as the library does, since it is not stored.
+- **`src/format/fractal_heap.rs`** — Fractal heaps and the doubling table, used to dereference the heap IDs that dense links and attributes are indexed by. Heap offsets are measured from the *start of the direct block*, including its prefix.
+- **`src/format/chunk_index.rs`** — Enumerates a chunked dataset's chunks through any of the six index structures into a common `ChunkRecord`. Element widths are taken from the sizes recorded in each index header rather than recomputed.
+- **`src/format/dense.rs`** — Links and attributes stored densely (fractal heap + v2 B-tree).
 - **`src/chunked.rs`** — `ChunkedDataset`: chunk B-tree traversal, filter decoding, and sub-region assembly for `read_full`/`read_range`.
 - **`src/object_store.rs`** — `ObjectStoreFile` (ranged GETs against an `ObjectStore`) plus the crate-private binrw fetch-and-parse helpers.
 - **`src/node_store.rs` / `src/node_fs.js`** — Node.js filesystem `ObjectStore` used only by the wasm32 test build.
@@ -66,5 +71,7 @@ File::open → SuperblockV0 → root DataObjectHeader → Group (btree + local h
 - Packed bitfield type descriptors are parsed as raw byte arrays with hand-written accessors (`FixedPointDescriptor`, `FloatingPointDescriptor` in `format/object.rs`).
 - `bytemuck::cast_slice_mut` for zero-copy reinterpretation of byte buffers as typed arrays.
 - Chunk decompression uses `flate2` with the `zlib-rs` feature (pure Rust zlib). Currently hardcoded for gzip+shuffle filter pipeline.
-- Only HDF5 v1 B-trees and Superblock v0 are implemented. No v2 B-tree or superblock v2/v3 support yet. The supported/unsupported matrix lives in the crate docs and README — update both when that changes.
+- Both on-disk formats are supported: superblock v0-v3, object header v1 and v2, and all six chunk index structures. The supported/unsupported matrix lives in the crate docs and README — update both when that changes.
+- Object header messages are dispatched explicitly by type in `parse_inner_message`, never through a `binrw` enum with a catch-all arm: a fall-through would turn a parse failure into a silently missing message.
+- Page-initialisation bitmaps in the array indexes are most-significant-bit first within each byte, matching `H5VM_bit_get`.
 - Reader is passed around as `ObjectStoreFile` which is thin wrapper around the ObjectStore trait (object_store crate).

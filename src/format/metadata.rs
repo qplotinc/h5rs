@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use binrw::{BinRead, BinResult, NullString};
 
-use crate::error::H5Result;
+use crate::error::{H5Error, H5Result};
 use crate::format::btree::*;
 use crate::object_store::{ObjectStoreFile, fetch_exact};
 
@@ -33,19 +33,96 @@ pub struct SuperblockV0 {
     pub root_group_symbol_table_entry: SymbolTableEntry,
 }
 
+/// Superblock versions 2 and 3. Version 3 differs only in that the consistency
+/// flags byte is meaningful (file locking / SWMR), which does not affect reads.
+///
+/// <https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html#subsec_fmt4_boot_super>
 #[derive(BinRead, Debug)]
 #[br(magic = b"\x89HDF\r\n\x1a\n")]
 #[allow(dead_code)]
-pub struct SuperblockV2 {
-    superblock_version: u8,
-    size_of_offsets: u8,
-    size_of_lengths: u8,
-    file_consistency_flags: u8,
-    base_address: u64,
-    superblock_extension_address: [u8; 8],
-    end_of_file_address: [u8; 8],
-    root_group_object_header_address: [u8; 8],
-    superblock_checksum: u32,
+pub struct SuperblockV23 {
+    pub superblock_version: u8,
+    pub size_of_offsets: u8,
+    pub size_of_lengths: u8,
+    pub file_consistency_flags: u8,
+    pub base_address: u64,
+    pub superblock_extension_address: u64,
+    pub end_of_file_address: u64,
+    pub root_group_object_header_address: u64,
+    pub superblock_checksum: u32,
+}
+
+/// The parts of the superblock h5rs needs, normalised across every version.
+#[derive(Debug, Clone)]
+pub struct Superblock {
+    /// Superblock version: 0, 1, 2 or 3. Kept for diagnostics.
+    #[allow(dead_code)]
+    pub version: u8,
+    /// Address of the root group's object header.
+    pub root_group_address: u64,
+}
+
+impl Superblock {
+    /// Read and normalise the superblock at the start of the file.
+    ///
+    /// h5rs requires 8-byte offsets and lengths (the HDF5 default) and a zero
+    /// base address; anything else is reported as unsupported rather than
+    /// silently mis-parsed.
+    pub async fn read(file: &ObjectStoreFile) -> H5Result<Superblock> {
+        let bytes = fetch_exact(file, 0, SUPERBLOCK_FETCH_SIZE).await?;
+        if bytes.len() < 9 {
+            return Err(H5Error::corrupt("file is too short to hold a superblock"));
+        }
+        let version = bytes[8];
+
+        let (sizes, base_address, root_group_address) = match version {
+            0 | 1 => {
+                let sb: SuperblockV0 = read_le_from(&bytes)?;
+                (
+                    (sb.size_of_offsets, sb.size_of_lengths),
+                    sb.base_address,
+                    sb.root_group_symbol_table_entry.object_header_address,
+                )
+            }
+            2 | 3 => {
+                let sb: SuperblockV23 = read_le_from(&bytes)?;
+                (
+                    (sb.size_of_offsets, sb.size_of_lengths),
+                    sb.base_address,
+                    sb.root_group_object_header_address,
+                )
+            }
+            v => {
+                return Err(H5Error::unsupported(format!("superblock version {v}")));
+            }
+        };
+
+        if sizes != (8, 8) {
+            return Err(H5Error::unsupported(format!(
+                "{}-byte offsets / {}-byte lengths (only 8/8 is implemented)",
+                sizes.0, sizes.1
+            )));
+        }
+        if base_address != 0 {
+            return Err(H5Error::unsupported(
+                "non-zero superblock base address (user block)",
+            ));
+        }
+
+        Ok(Superblock {
+            version,
+            root_group_address,
+        })
+    }
+}
+
+/// The largest superblock (version 1, with 8-byte addresses) fits well within this.
+const SUPERBLOCK_FETCH_SIZE: u64 = 256;
+
+/// Parse a little-endian `binrw` structure from an in-memory buffer.
+fn read_le_from<T: for<'a> BinRead<Args<'a> = ()>>(bytes: &[u8]) -> H5Result<T> {
+    let mut cursor = Cursor::new(bytes);
+    Ok(T::read_le(&mut cursor)?)
 }
 
 /// v1 BTrees

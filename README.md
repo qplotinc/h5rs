@@ -53,26 +53,29 @@ let slice = ds.read_range::<u32>(&[1_000..2_000], &file).await?;
 Swap `LocalFileSystem` for `AmazonS3`, `GoogleCloudStorage`, `MicrosoftAzure`, or `HttpStore` and the same code reads over the network, issuing one ranged GET per chunk.
 
 ## Implemented
-- Support widely used HDF5 features
+- Support widely used HDF5 features, in both the pre-1.10 and the 1.10+ on-disk formats
 - Reasonable performance profile, good multithreading support when decompressing chunked data.
 - Async API
 - Differential, randomized testing against the gold standard [hdf5](https://crates.io/crates/hdf5) wrapper crate.
 
 ## Format coverage
 
-h5rs implements the subset of HDF5 that files in the wild actually use — the "earliest" format bounds that `h5py` and most writers emit by default.
+h5rs reads both of the on-disk formats the HDF5 library emits: the "earliest" encoding that `h5py` and most writers produce by default, and the "latest" encoding introduced with HDF5 1.10 and selected by `H5Pset_libver_bounds`.
 
 | Area | Supported | Not yet |
 |---|---|---|
-| Superblock | v0 | v1, v2, v3 |
-| Group index | v1 B-tree + symbol table | v2 B-tree, fractal heap, "new-style" groups |
-| Object header | v1 | v2 (`OHDR`) |
-| Chunk index | v1 B-tree | fixed array, extensible array, single chunk |
-| Layout | contiguous, chunked | compact |
-| Filters | deflate (gzip), shuffle | szip, blosc, lzf, scale-offset |
+| Superblock | v0, v1, v2, v3 | non-zero base address (user block) |
+| Object header | v1, v2 (`OHDR`), continuation blocks | shared messages |
+| Group links | symbol table, compact link messages, fractal heap + v2 B-tree | soft, external and user-defined links |
+| Chunk index | v1 B-tree, single chunk, implicit, fixed array, extensible array, v2 B-tree | |
+| Data layout | chunked (message v1-v5) | contiguous, compact and virtual are listed but not read |
+| Filters | deflate (gzip), shuffle, per-chunk filter masks | szip, blosc, lzf, n-bit, scale-offset, fletcher32 |
 | Datatypes | fixed-point, floating-point, string, variable-length | compound, enum, array, reference |
+| Attributes | message v1-v3, compact and dense | shared datatypes and dataspaces |
 
-Files written with HDF5's *latest* format bounds (`H5Pset_libver_bounds`) use v2/v3 superblocks and v2 object headers, and are not readable yet.
+Addresses and lengths must be 8 bytes wide, which is the HDF5 default; anything else is reported as unsupported rather than mis-parsed. Metadata checksums are parsed past but not verified.
+
+Every round-trip test runs against both formats, and the fuzzer randomises which one it writes, asserting on the way out that it reached all of the chunk index structures.
 
 ## Open to contributions, but not on the roadmap
 - Sync API
@@ -89,6 +92,10 @@ Files written with HDF5's *latest* format bounds (`H5Pset_libver_bounds`) use v2
 cargo test          # unit + range-read tests; no external dependencies
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+
+# Inspect a file
+cargo run --example dump -- path/to/file.h5
+cargo run --example dump -- path/to/file.h5 /group/dataset
 ```
 
 ### Differential tests against the HDF5 C library

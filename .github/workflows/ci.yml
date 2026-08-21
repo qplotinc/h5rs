@@ -62,8 +62,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --target wasm32-unknown-unknown
-      # --all-targets also type-checks the wasm-only NodeFileSystem test store.
-      - run: cargo check --target wasm32-unknown-unknown --all-targets
+      # Also type-check the wasm-only NodeFileSystem test store. The examples
+      # are native-only, so they are excluded rather than checked here.
+      - run: cargo check --target wasm32-unknown-unknown --lib --tests
 
   docs:
     name: rustdoc
