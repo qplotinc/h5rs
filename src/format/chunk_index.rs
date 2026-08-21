@@ -16,7 +16,7 @@ use crate::format::btree::collect_btree_leaves_args;
 use crate::format::btree2::BTreeV2Header;
 use crate::format::metadata::ChunkBTreeV1;
 use crate::format::object::{ChunkIndex, ChunkedLayout, is_undefined_address};
-use crate::object_store::{ObjectStoreFile, fetch_exact};
+use crate::object_store::{ObjectStoreFile, fetch_metadata};
 
 /// One chunk of a chunked dataset, as located through the dataset's index.
 #[derive(Debug, Clone)]
@@ -247,7 +247,7 @@ async fn read_fixed_array(
 
     let elements = if !paged {
         let block_size = DBLK_PREFIX + nelmts * format.entry_size as u64 + 4;
-        let bytes = fetch_exact(file, header.data_block_address, block_size).await?;
+        let bytes = fetch_metadata(file, header.data_block_address, block_size).await?;
         check_signature(&bytes, b"FADB", "fixed array data block")?;
         bytes[DBLK_PREFIX as usize..].to_vec()
     } else {
@@ -259,7 +259,7 @@ async fn read_fixed_array(
         let page_stride = page_nelmts * format.entry_size as u64 + 4;
         let total = dblk_size + npages * page_stride;
 
-        let bytes = fetch_exact(file, header.data_block_address, total).await?;
+        let bytes = fetch_metadata(file, header.data_block_address, total).await?;
         check_signature(&bytes, b"FADB", "fixed array data block")?;
         let bitmap = &bytes[DBLK_PREFIX as usize..(DBLK_PREFIX + bitmap_bytes) as usize];
 
@@ -422,7 +422,7 @@ async fn read_extensible_array(
     let idx_elmts = header.index_blk_elmts as u64;
     let iblock_size =
         BLOCK_OVERHEAD + 8 + idx_elmts * format.entry_size as u64 + (ndblk_addrs + nsblk_addrs) * 8;
-    let bytes = fetch_exact(file, header.index_block_address, iblock_size).await?;
+    let bytes = fetch_metadata(file, header.index_block_address, iblock_size).await?;
     check_signature(&bytes, b"EAIB", "extensible array index block")?;
 
     let mut pos = 4 + 1 + 1 + 8; // signature, version, client ID, header address
@@ -537,7 +537,7 @@ async fn read_ea_secondary_block(
     };
 
     let size = BLOCK_OVERHEAD + 8 + offset_bytes + bitmap_bytes + sblk.ndblks * 8;
-    let bytes = fetch_exact(file, address, size).await?;
+    let bytes = fetch_metadata(file, address, size).await?;
     check_signature(&bytes, b"EASB", "extensible array secondary block")?;
 
     let addr_start = (4 + 1 + 1 + 8 + offset_bytes + bitmap_bytes) as usize;
@@ -585,7 +585,7 @@ async fn read_ea_data_block(
 
     if nelmts <= page_nelmts {
         let size = prefix + nelmts * format.entry_size as u64 + 4;
-        let bytes = fetch_exact(file, address, size).await?;
+        let bytes = fetch_metadata(file, address, size).await?;
         check_signature(&bytes, b"EADB", "extensible array data block")?;
         let start = prefix as usize;
         let len = (nelmts * format.entry_size as u64) as usize;
@@ -602,7 +602,7 @@ async fn read_ea_data_block(
     let npages = nelmts.div_ceil(page_nelmts);
     let page_stride = page_nelmts * format.entry_size as u64 + 4;
     let size = prefix + npages * page_stride;
-    let bytes = fetch_exact(file, address, size).await?;
+    let bytes = fetch_metadata(file, address, size).await?;
     check_signature(&bytes, b"EADB", "extensible array data block")?;
 
     let mut records = vec![];

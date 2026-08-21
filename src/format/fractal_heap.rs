@@ -11,7 +11,7 @@ use binrw::BinRead;
 use bytes::Bytes;
 
 use crate::error::{H5Error, H5Result};
-use crate::object_store::{ObjectStoreFile, fetch_exact, read_metadata};
+use crate::object_store::{ObjectStoreFile, fetch_metadata, read_metadata};
 
 #[derive(BinRead, Debug)]
 #[br(magic = b"FRHP")]
@@ -168,7 +168,7 @@ impl FractalHeap {
             ));
         }
 
-        let bytes = fetch_exact(file, block_address + start, length).await?;
+        let bytes = fetch_metadata(file, block_address + start, length).await?;
         Ok(bytes.to_vec())
     }
 
@@ -291,7 +291,7 @@ impl FractalHeap {
         // which `locate` has already rejected.
         let entry_size = 8;
         let size = 4 + 1 + 8 + self.offset_bytes() + ndirect * entry_size + nindirect * 8 + 4;
-        let bytes: Bytes = fetch_exact(file, address, size).await?;
+        let bytes: Bytes = fetch_metadata(file, address, size).await?;
         if bytes.len() < 5 || &bytes[..4] != b"FHIB" {
             return Err(H5Error::corrupt("expected a fractal heap indirect block"));
         }

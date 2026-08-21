@@ -41,6 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    report_io(&file, "listing");
+
     let Some(wanted) = wanted else {
         return Ok(());
     };
@@ -70,7 +72,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (true, _, 8) => print_head(ds.read_full::<f64>(&file).await?.data),
         _ => println!("(no printer for this element type)"),
     }
+    report_io(&file, "total");
     Ok(())
+}
+
+/// Show what the read cost in requests and bytes, which is what matters when
+/// the file lives in object storage rather than on local disk.
+fn report_io(file: &ObjectStoreFile, label: &str) {
+    let s = file.stats();
+    println!(
+        "[io] {label}: {} round trips, {} requests, {:.2} MiB read, {} cache hits",
+        s.batches,
+        s.requests,
+        s.bytes_fetched as f64 / (1024.0 * 1024.0),
+        s.cache_hits
+    );
 }
 
 fn print_head<T: std::fmt::Debug>(data: Vec<T>) {

@@ -55,6 +55,33 @@ Swap `LocalFileSystem` for `AmazonS3`, `GoogleCloudStorage`, `MicrosoftAzure`, o
 
 For a contiguous dataset a range read is a single ranged GET covering the selection — exact for a one-dimensional range, and spanning the touched rows for higher-rank selections.
 
+## Round trips
+
+Over object storage a request costs far more than the bytes it carries, so h5rs is built to minimise requests rather than bytes. Measured against a 1.4 GB single-cell file:
+
+| workload | round trips | bytes read |
+|---|---|---|
+| list all datasets | 1 | 0.5 MiB |
+| read a 100k-element slice | 4 | 1.7 MiB |
+| read a 133 MB dataset (2000+ chunks) | 6 | 134 MiB |
+| list a group of 60 datasets spread across the file | 5 | 2.3 MiB |
+
+Two things get it there. Metadata is read in aligned blocks (512 KiB by default), so following a pointer to a nearby structure usually costs no further request. And wherever a set of addresses is known at once — a B-tree level, a group's object headers, the chunks a selection overlaps — they are fetched together: merged into one request where they lie close, issued in parallel where they do not.
+
+`ObjectStoreFile::stats()` reports what a read cost, and `ReadOptions` tunes the trade-off:
+
+```rust
+use h5rs::object_store::{ObjectStoreFile, ReadOptions};
+
+let file = ObjectStoreFile::with_options(
+    Box::new(store),
+    Path::from("matrix.h5"),
+    ReadOptions { metadata_block_size: 1 << 20, ..Default::default() },
+);
+// ... read ...
+println!("{:?}", file.stats());
+```
+
 ## Implemented
 - Support widely used HDF5 features, in both the pre-1.10 and the 1.10+ on-disk formats
 - Reasonable performance profile, good multithreading support when decompressing chunked data.
@@ -131,6 +158,9 @@ library.
 
 ```bash
 cargo test --features hdf5-compare perf -- --ignored --nocapture
+
+# Round trips and bytes across read-ahead settings and file shapes
+cargo test --features hdf5-compare io_tuning -- --ignored --nocapture
 ```
 
 ## License

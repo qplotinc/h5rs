@@ -28,6 +28,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   covering the selection rather than the whole dataset.
 - Support for scalar and null dataspaces.
 - `Dataset::layout_name`, and a `layout` field on `DatasetInfo`.
+- Round-trip minimisation for object storage. Metadata is read in aligned
+  512 KiB blocks and cached, so following a pointer to a nearby structure
+  usually costs no request; and wherever a set of addresses is known at once —
+  a B-tree level, a group's object headers, the chunks a selection overlaps —
+  they are fetched together, merged where close and issued in parallel where
+  not. Listing every dataset in a 1.4 GB file now costs one round trip, and
+  reading a 133 MB dataset over 2000 chunks costs six rather than 2125.
+- `ObjectStoreFile::stats` reports requests, round trips and bytes read;
+  `ReadOptions` tunes read-ahead, cache size, batch size and coalescing.
+- A dataset remembers its chunk index, so repeated range reads on one dataset
+  do not re-walk it.
 - A `dump` example that lists a file's datasets and reads one.
 
 ### Changed
@@ -36,6 +47,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now `open_dataset`, since reads are no longer limited to chunked datasets.
   `chunk_shape` and `chunk_index_name` return `Option`, being `None` for a
   dataset that is not chunked.
+- Speculative reads are trimmed to the object's size, learned from the first
+  response, rather than being rejected by the store for starting past the end
+  of the file.
 - Object headers are read in two phases — prefix first, then the exact extent —
   so a header larger than the default metadata fetch (a big compact dataset, or
   a long run of attributes) no longer fails to parse.

@@ -4,7 +4,7 @@ use binrw::{BinRead, BinResult, NullString};
 
 use crate::error::{H5Error, H5Result};
 use crate::format::btree::*;
-use crate::object_store::{ObjectStoreFile, fetch_exact};
+use crate::object_store::{ObjectStoreFile, fetch_metadata};
 
 #[derive(BinRead, Debug)]
 #[br(magic = b"\x89HDF\r\n\x1a\n")]
@@ -69,7 +69,7 @@ impl Superblock {
     /// base address; anything else is reported as unsupported rather than
     /// silently mis-parsed.
     pub async fn read(file: &ObjectStoreFile) -> H5Result<Superblock> {
-        let bytes = fetch_exact(file, 0, SUPERBLOCK_FETCH_SIZE).await?;
+        let bytes = fetch_metadata(file, 0, SUPERBLOCK_FETCH_SIZE).await?;
         if bytes.len() < 9 {
             return Err(H5Error::corrupt("file is too short to hold a superblock"));
         }
@@ -287,7 +287,7 @@ pub struct LocalHeap {
 
 impl LocalHeap {
     pub async fn load(&self, file: &ObjectStoreFile) -> H5Result<LoadedLocalHeap> {
-        let data = fetch_exact(file, self.data_segment_address, self.data_segment_size).await?;
+        let data = fetch_metadata(file, self.data_segment_address, self.data_segment_size).await?;
         Ok(LoadedLocalHeap {
             data: data.to_vec(),
         })

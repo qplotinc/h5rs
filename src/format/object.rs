@@ -533,14 +533,14 @@ impl DataObjectHeader {
             return Ok(None);
         };
 
-        Ok(Some(Dataset {
+        Ok(Some(Dataset::new(
             name,
-            dataspace: dataspace.clone(),
-            datatype: datatype.clone(),
-            layout: layout.clone(),
-            filter: self.filter_message().cloned(),
-            attributes: self.all_attributes(file).await?,
-        }))
+            dataspace.clone(),
+            datatype.clone(),
+            layout.clone(),
+            self.filter_message().cloned(),
+            self.all_attributes(file).await?,
+        )))
     }
 }
 

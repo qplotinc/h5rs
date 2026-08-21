@@ -43,6 +43,25 @@
 //! primitives. Asking for the wrong type returns [`H5Error::TypeMismatch`]
 //! rather than reinterpreting the bytes.
 //!
+//! # Round trips
+//!
+//! Over object storage a request costs far more than the bytes it carries, so
+//! h5rs is built to minimise them rather than to minimise bytes read. Listing
+//! every dataset in a 1.4 GB file costs one round trip; reading a 133 MB
+//! dataset spread over 2000 chunks costs about six.
+//!
+//! Two things get it there. Metadata is read in aligned blocks, so following a
+//! pointer to a nearby structure usually needs no further request. And wherever
+//! a set of addresses is known at once — a B-tree level, a group's object
+//! headers, the chunks a selection overlaps — they are fetched together, merged
+//! where they lie close and issued in parallel where they do not.
+//!
+//! [`ObjectStoreFile::stats`] reports what a read actually cost, and
+//! [`ReadOptions`] tunes the trade-off.
+//!
+//! [`ObjectStoreFile::stats`]: crate::object_store::ObjectStoreFile::stats
+//! [`ReadOptions`]: crate::object_store::ReadOptions
+//!
 //! # Errors
 //!
 //! h5rs reads files it did not write, usually over a network, so every failure
@@ -94,7 +113,7 @@ use crate::format::{
 };
 use binrw::BinRead;
 
-use crate::object_store::{ObjectStoreFile, read_metadata};
+use crate::object_store::ObjectStoreFile;
 
 pub(crate) mod dataset;
 pub mod error;
@@ -134,14 +153,17 @@ pub async fn list_datasets(
 
     while let Some((group, prefix)) = stack.pop() {
         let refs = group.object_refs(file).await?;
-        for (name, address) in &refs {
+        // Every member's address is known before any of their headers is read,
+        // so read them together instead of one round trip per object.
+        let addresses: Vec<u64> = refs.iter().map(|(_, address)| *address).collect();
+        let headers = read_object_headers(file, &addresses).await?;
+
+        for ((name, _), header) in refs.iter().zip(headers) {
             let child_path = if prefix.is_empty() {
                 format!("/{name}")
             } else {
                 format!("{prefix}/{name}")
             };
-
-            let header = read_object_header(file, *address).await?;
 
             if let Some(g) = header.to_group(file).await? {
                 stack.push((g, child_path));
@@ -200,23 +222,54 @@ pub async fn open_dataset(
 }
 
 /// Read an object header at `address` and follow its continuation blocks.
+async fn read_object_header(file: &ObjectStoreFile, address: u64) -> H5Result<DataObjectHeader> {
+    Ok(read_object_headers(file, &[address]).await?.remove(0))
+}
+
+/// Read several object headers at once.
 ///
 /// An object header has no bounded size: a compact dataset or a run of
-/// attributes can make one arbitrarily large. So the prefix is read from a
-/// default-sized block first, and only if the header turns out to be longer is
-/// a second, exactly-sized request made.
-async fn read_object_header(file: &ObjectStoreFile, address: u64) -> H5Result<DataObjectHeader> {
-    let mut bytes = crate::object_store::fetch_metadata_block(file, address).await?;
-    let extent = crate::format::object::header_chunk_extent(&bytes)
-        .ok_or_else(|| H5Error::corrupt("truncated object header prefix"))?;
-    if extent > bytes.len() as u64 {
-        bytes = crate::object_store::fetch_exact(file, address, extent).await?;
+/// attributes can make one arbitrarily large. So a default-sized prefix is read
+/// first to learn each header's extent, and only the headers that turn out to
+/// be longer are read again. Both passes are batched, so a whole group's worth
+/// of headers costs one or two round trips rather than one per object.
+async fn read_object_headers(
+    file: &ObjectStoreFile,
+    addresses: &[u64],
+) -> H5Result<Vec<DataObjectHeader>> {
+    let prefix_spans: Vec<(u64, u64)> = addresses
+        .iter()
+        .map(|&a| (a, crate::object_store::METADATA_FETCH_SIZE))
+        .collect();
+    let mut blocks = file.read_metadata_many(&prefix_spans).await?;
+
+    let mut extents = Vec::with_capacity(addresses.len());
+    for bytes in &blocks {
+        extents.push(
+            crate::format::object::header_chunk_extent(bytes)
+                .ok_or_else(|| H5Error::corrupt("truncated object header prefix"))?,
+        );
     }
 
-    let mut cursor = std::io::Cursor::new(bytes);
-    let mut header = DataObjectHeader::read_le(&mut cursor)?;
-    header.load_continuation_messages(file).await?;
-    Ok(header)
+    let long: Vec<usize> = (0..addresses.len())
+        .filter(|&i| extents[i] > blocks[i].len() as u64)
+        .collect();
+    if !long.is_empty() {
+        let spans: Vec<(u64, u64)> = long.iter().map(|&i| (addresses[i], extents[i])).collect();
+        for (&i, bytes) in long.iter().zip(file.read_metadata_many(&spans).await?) {
+            blocks[i] = bytes;
+        }
+    }
+
+    let mut headers = Vec::with_capacity(addresses.len());
+    for bytes in blocks {
+        let mut header = DataObjectHeader::read_le(&mut std::io::Cursor::new(bytes))?;
+        // Continuation blocks are rare, and each one's address is only known
+        // once its parent is parsed, so these stay one at a time.
+        header.load_continuation_messages(file).await?;
+        headers.push(header);
+    }
+    Ok(headers)
 }
 
 struct File {
@@ -246,6 +299,11 @@ impl Object {
         self.header.to_group(file).await
     }
 }
+
+/// How much of a symbol table node to read before its length is known. A node
+/// holds at most `2 * group_leaf_node_k` entries of 40 bytes plus a small
+/// header, which fits comfortably.
+const SYMBOL_TABLE_FETCH_SIZE: u64 = 8192;
 
 /// Keep only the hard links, which are the ones h5rs can follow directly.
 ///
@@ -293,9 +351,17 @@ impl Group {
         match &self.links {
             GroupLinks::SymbolTable { btree, heap } => {
                 let ptrs: Vec<GroupPointerV1> = collect_btree_leaves(file, btree.clone()).await?;
+                // Read every symbol table node in one batched request rather
+                // than walking them one at a time.
+                let spans: Vec<(u64, u64)> = ptrs
+                    .iter()
+                    .map(|p| (p.child_pointer, SYMBOL_TABLE_FETCH_SIZE))
+                    .collect();
+                let blocks = file.read_metadata_many(&spans).await?;
+
                 let mut res = vec![];
-                for p in ptrs {
-                    let st: GroupSymbolTableNode = read_metadata(file, p.child_pointer).await?;
+                for bytes in blocks {
+                    let st = GroupSymbolTableNode::read_le(&mut std::io::Cursor::new(bytes))?;
                     for e in &st.entries {
                         let name = heap.get_string(e.link_name_offset)?;
                         res.push((name, e.object_header_address));
@@ -342,7 +408,7 @@ mod roundtrip {
     use crate::h5type::H5Type;
     use crate::object_store::ObjectStoreFile;
 
-    fn test_file_abs(path: &std::path::Path) -> ObjectStoreFile {
+    pub(crate) fn test_file_abs(path: &std::path::Path) -> ObjectStoreFile {
         let parent = path.parent().unwrap();
         let filename = path.file_name().unwrap().to_str().unwrap();
         let store = LocalFileSystem::new_with_prefix(parent).unwrap();
@@ -2173,6 +2239,299 @@ mod test {
         assert_eq!(overlapping, 3, "expected exactly 3 chunks for this range");
 
         Ok(())
+    }
+
+    // ---- I/O shape ----
+
+    /// Guard the round-trip count against regressions.
+    ///
+    /// The absolute numbers matter less than their scale: reading a dataset
+    /// spread over hundreds of chunks, and listing a group of hundreds of
+    /// datasets, must both stay in the single digits rather than growing with
+    /// the number of chunks or objects.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
+    #[tokio::test]
+    // `&[a..b]` is a one-dimensional selection, not a mis-typed range literal.
+    #[allow(clippy::single_range_in_vec_init)]
+    async fn round_trips_do_not_scale_with_object_count() -> H5Result<()> {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let hf = hdf5::File::create(tmp.path()).unwrap();
+            let grp = hf.create_group("g").unwrap();
+            for i in 0..120 {
+                let d = grp
+                    .new_dataset::<u32>()
+                    .shape(&[4096][..])
+                    .chunk(&[64][..])
+                    .create(format!("d{i:03}").as_str())
+                    .unwrap();
+                d.write_raw(&(0u32..4096).collect::<Vec<_>>()).unwrap();
+            }
+        }
+        let path = tmp.path();
+
+        // 120 datasets, each with 64 chunks.
+        let file = crate::roundtrip::test_file_abs(path);
+        let listed = crate::list_datasets(&file).await?;
+        assert_eq!(listed.len(), 120);
+        let listing = file.stats();
+        assert!(
+            listing.batches <= 12,
+            "listing 120 datasets took {} round trips: {listing:?}",
+            listing.batches
+        );
+
+        let file = crate::roundtrip::test_file_abs(path);
+        let ds = crate::open_dataset(&file, &["g", "d000"]).await?.unwrap();
+        let all = ds.read_full::<u32>(&file).await?;
+        assert_eq!(all.data.len(), 4096);
+        let full = file.stats();
+        assert!(
+            full.batches <= 8,
+            "reading 64 chunks took {} round trips: {full:?}",
+            full.batches
+        );
+
+        // A second range read reuses the chunk index, so it costs at most the
+        // one fetch of the chunk it needs.
+        let before = file.stats().batches;
+        ds.read_range::<u32>(&[100..200], &file).await?;
+        let extra = file.stats().batches - before;
+        assert!(
+            extra <= 1,
+            "a repeat range read took {extra} extra round trips"
+        );
+
+        Ok(())
+    }
+
+    /// Measure how many round trips and bytes each workload costs across a
+    /// range of read-ahead settings, so the defaults are chosen from
+    /// measurements rather than guessed.
+    ///
+    /// `waits` is the number of times the reader had to stop and wait on the
+    /// store; requests issued within one wait go in parallel, so that column is
+    /// what decides elapsed time over a high-latency link.
+    ///
+    /// Run with: `cargo test --features hdf5-compare io_tuning -- --ignored --nocapture`
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
+    #[tokio::test]
+    #[ignore]
+    async fn io_tuning() -> H5Result<()> {
+        use crate::object_store::ReadOptions;
+
+        require_dataset!(MOL_INFO_FILE);
+        require_dataset!(MATRIX_FILE);
+        const KIB: u64 = 1024;
+        const BLOCKS: [u64; 6] = [
+            8 * KIB,
+            64 * KIB,
+            128 * KIB,
+            256 * KIB,
+            512 * KIB,
+            1024 * KIB,
+        ];
+
+        // A file whose metadata is densely packed, which is where read-ahead
+        // has the most to gain.
+        let dense = tempfile::NamedTempFile::new().unwrap();
+        {
+            let hf = hdf5::File::create(dense.path()).unwrap();
+            let grp = hf.create_group("g").unwrap();
+            for i in 0..200 {
+                let d = grp
+                    .new_dataset::<u32>()
+                    .shape(&[64][..])
+                    .chunk(&[64][..])
+                    .create(format!("d{i:03}").as_str())
+                    .unwrap();
+                d.write_raw(&(0u32..64).collect::<Vec<_>>()).unwrap();
+                d.new_attr::<u32>()
+                    .shape(&[1][..])
+                    .create("n")
+                    .unwrap()
+                    .write_raw(&[i as u32])
+                    .unwrap();
+            }
+        }
+        let dense_path = dense.path().to_path_buf();
+
+        // The adversarial shape for read-ahead: many datasets whose headers are
+        // pushed far apart by the bulk data written between them, so a
+        // speculative block rarely contains anything else that is wanted.
+        let spread = tempfile::NamedTempFile::new().unwrap();
+        {
+            let hf = hdf5::File::create(spread.path()).unwrap();
+            let grp = hf.create_group("g").unwrap();
+            let payload: Vec<u32> = (0..250_000).collect();
+            for i in 0..60 {
+                let d = grp
+                    .new_dataset::<u32>()
+                    .shape(&[payload.len()][..])
+                    .chunk(&[payload.len()][..])
+                    .create(format!("d{i:03}").as_str())
+                    .unwrap();
+                d.write_raw(&payload).unwrap();
+            }
+        }
+        let spread_path = spread.path().to_path_buf();
+
+        let header: String = BLOCKS
+            .iter()
+            .map(|b| format!("{:>14}", format!("{}K", b / 1024)))
+            .collect();
+        println!("\n{:<34}{header}", "workload (waits / MB read)");
+        println!("{:-<104}", "");
+
+        // Each workload is run once per block size on a fresh handle, so no
+        // cache carries over between measurements.
+        for (name, workload) in workloads(&dense_path, &spread_path) {
+            let mut row = String::new();
+            for block in BLOCKS {
+                let options = ReadOptions {
+                    metadata_block_size: block,
+                    ..ReadOptions::default()
+                };
+                let file = workload.open(options);
+                workload.run(&file).await?;
+                let s = file.stats();
+                row.push_str(&format!(
+                    "{:>14}",
+                    format!(
+                        "{} / {:.1}",
+                        s.batches,
+                        s.bytes_fetched as f64 / (1024.0 * 1024.0)
+                    )
+                ));
+            }
+            println!("{name:<34}{row}");
+        }
+
+        // The same workloads with batching switched off, to show what the
+        // level-wise and per-chunk batching is worth on its own.
+        println!(
+            "\n{:<34}{:>14}{:>14}",
+            "batching off vs on (waits)", "one-by-one", "batched"
+        );
+        println!("{:-<62}", "");
+        for (name, workload) in workloads(&dense_path, &spread_path) {
+            let mut row = String::new();
+            for max_batch_bytes in [1, 64 * 1024 * 1024] {
+                let options = ReadOptions {
+                    metadata_block_size: 128 * KIB,
+                    max_batch_bytes,
+                    ..ReadOptions::default()
+                };
+                let file = workload.open(options);
+                workload.run(&file).await?;
+                row.push_str(&format!("{:>14}", file.stats().batches));
+            }
+            println!("{name:<34}{row}");
+        }
+
+        Ok(())
+    }
+
+    /// One measurable read pattern.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
+    struct Workload {
+        path: std::path::PathBuf,
+        kind: WorkloadKind,
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
+    enum WorkloadKind {
+        /// Walk the whole group tree, touching metadata only.
+        List,
+        /// Open one dataset and take a slice out of the middle of it.
+        Slice { dataset: &'static str, count: u64 },
+        /// Read one dataset end to end.
+        Full { dataset: &'static str },
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
+    impl Workload {
+        fn open(&self, options: crate::object_store::ReadOptions) -> ObjectStoreFile {
+            use object_store::local::LocalFileSystem;
+            let path = self.path.canonicalize().unwrap();
+            let store = LocalFileSystem::new_with_prefix(path.parent().unwrap()).unwrap();
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            ObjectStoreFile::with_options(Box::new(store), Path::from(name), options)
+        }
+
+        async fn run(&self, file: &ObjectStoreFile) -> H5Result<()> {
+            match &self.kind {
+                WorkloadKind::List => {
+                    crate::list_datasets(file).await?;
+                }
+                #[allow(clippy::single_range_in_vec_init)]
+                WorkloadKind::Slice { dataset, count } => {
+                    let ds = crate::open_dataset(file, &[dataset]).await?.unwrap();
+                    let mid = ds.shape()[0] / 2;
+                    ds.read_range::<u32>(&[mid..mid + count], file).await?;
+                }
+                WorkloadKind::Full { dataset } => {
+                    let ds = crate::open_dataset(file, &[dataset]).await?.unwrap();
+                    ds.read_full::<u32>(file).await?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "hdf5-compare"))]
+    fn workloads(dense: &std::path::Path, spread: &std::path::Path) -> Vec<(String, Workload)> {
+        let mol = std::path::PathBuf::from(MOL_INFO_FILE);
+        let matrix = std::path::PathBuf::from(MATRIX_FILE);
+        vec![
+            (
+                "mol_info: list".to_string(),
+                Workload {
+                    path: mol.clone(),
+                    kind: WorkloadKind::List,
+                },
+            ),
+            (
+                "mol_info: slice 100k".to_string(),
+                Workload {
+                    path: mol.clone(),
+                    kind: WorkloadKind::Slice {
+                        dataset: "barcode_corrected_reads",
+                        count: 100_000,
+                    },
+                },
+            ),
+            (
+                "mol_info: read_full 34M".to_string(),
+                Workload {
+                    path: mol,
+                    kind: WorkloadKind::Full {
+                        dataset: "barcode_corrected_reads",
+                    },
+                },
+            ),
+            (
+                "matrix: list".to_string(),
+                Workload {
+                    path: matrix,
+                    kind: WorkloadKind::List,
+                },
+            ),
+            (
+                "dense 200 datasets: list".to_string(),
+                Workload {
+                    path: dense.to_path_buf(),
+                    kind: WorkloadKind::List,
+                },
+            ),
+            (
+                "spread 60 datasets: list".to_string(),
+                Workload {
+                    path: spread.to_path_buf(),
+                    kind: WorkloadKind::List,
+                },
+            ),
+        ]
     }
 
     // ---- Performance comparison tests (native only) ----

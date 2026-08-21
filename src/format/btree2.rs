@@ -12,7 +12,7 @@
 use binrw::BinRead;
 
 use crate::error::{H5Error, H5Result};
-use crate::object_store::{ObjectStoreFile, fetch_exact, read_metadata};
+use crate::object_store::{ObjectStoreFile, read_metadata};
 
 /// The prefix and checksum around every internal and leaf node: a 4-byte
 /// signature, a version and type byte, and a trailing 4-byte checksum.
@@ -123,51 +123,69 @@ impl BTreeV2Header {
     }
 
     /// Every record in the tree, as raw `record_size`-byte slices.
+    ///
+    /// Walking is breadth-first so that each level of the tree costs a single
+    /// batched request rather than one request per node.
     pub async fn collect_records(&self, file: &ObjectStoreFile) -> H5Result<Vec<Vec<u8>>> {
         if self.root_address == u64::MAX || self.root_nrec == 0 {
             return Ok(vec![]);
         }
 
         let mut records = vec![];
-        // (address, number of records, depth)
-        let mut stack = vec![(self.root_address, self.root_nrec as u64, self.depth)];
+        // (address, number of records) for every node at the current depth.
+        let mut level = vec![(self.root_address, self.root_nrec as u64)];
+        let mut depth = self.depth;
 
-        while let Some((address, nrec, depth)) = stack.pop() {
-            let bytes = fetch_exact(file, address, self.node_size as u64).await?;
-            let expected: &[u8; 4] = if depth == 0 { b"BTLF" } else { b"BTIN" };
-            if bytes.len() < 6 || &bytes[..4] != expected {
-                return Err(H5Error::corrupt(format!(
-                    "expected a {} node at {address}",
-                    String::from_utf8_lossy(expected)
-                )));
-            }
+        while !level.is_empty() {
+            let spans: Vec<(u64, u64)> = level
+                .iter()
+                .map(|&(address, _)| (address, self.node_size as u64))
+                .collect();
+            let nodes = file.read_metadata_many(&spans).await?;
 
-            let mut pos = 6usize; // signature, version, type
-            let record_len = self.record_size as usize;
-            for _ in 0..nrec {
-                let end = pos + record_len;
-                if end > bytes.len() {
-                    return Err(H5Error::corrupt("v2 B-tree node overruns its node size"));
+            let mut next = vec![];
+            for ((address, nrec), bytes) in level.iter().zip(&nodes) {
+                let expected: &[u8; 4] = if depth == 0 { b"BTLF" } else { b"BTIN" };
+                if bytes.len() < 6 || &bytes[..4] != expected {
+                    return Err(H5Error::corrupt(format!(
+                        "expected a {} node at {address}",
+                        String::from_utf8_lossy(expected)
+                    )));
                 }
-                records.push(bytes[pos..end].to_vec());
-                pos = end;
+
+                let mut pos = 6usize; // signature, version, type
+                let record_len = self.record_size as usize;
+                for _ in 0..*nrec {
+                    let end = pos + record_len;
+                    if end > bytes.len() {
+                        return Err(H5Error::corrupt("v2 B-tree node overruns its node size"));
+                    }
+                    records.push(bytes[pos..end].to_vec());
+                    pos = end;
+                }
+
+                if depth == 0 {
+                    continue;
+                }
+
+                // An internal node has one more child pointer than it has records.
+                let total_size = self.node_info[depth as usize - 1].cum_max_nrec_size as usize;
+                let nrec_size = self.max_nrec_size as usize;
+                for _ in 0..=*nrec {
+                    let child = read_uint(bytes, pos, 8)?;
+                    pos += 8;
+                    let child_nrec = read_uint(bytes, pos, nrec_size)?;
+                    pos += nrec_size;
+                    pos += total_size;
+                    next.push((child, child_nrec));
+                }
             }
 
             if depth == 0 {
-                continue;
+                break;
             }
-
-            // An internal node has one more child pointer than it has records.
-            let total_size = self.node_info[depth as usize - 1].cum_max_nrec_size as usize;
-            let nrec_size = self.max_nrec_size as usize;
-            for _ in 0..=nrec {
-                let child = read_uint(&bytes, pos, 8)?;
-                pos += 8;
-                let child_nrec = read_uint(&bytes, pos, nrec_size)?;
-                pos += nrec_size;
-                pos += total_size;
-                stack.push((child, child_nrec, depth - 1));
-            }
+            depth -= 1;
+            level = next;
         }
 
         Ok(records)

@@ -13,7 +13,7 @@ use crate::format::{
     },
 };
 use crate::h5type::H5Type;
-use crate::object_store::{ObjectStoreFile, fetch_exact};
+use crate::object_store::{ObjectStoreFile, fetch_data};
 
 /// N-dimensional array wrapper that pairs a flat data vector with its logical shape.
 /// Data is in row-major (C) order.
@@ -90,6 +90,16 @@ fn copy_region_inner(
     }
 }
 
+/// Where one chunk's contribution to the output lives, in elements.
+struct ChunkCopy {
+    /// Offset of the intersection within the chunk.
+    src_start: Vec<usize>,
+    /// Offset of the intersection within the output array.
+    dst_start: Vec<usize>,
+    /// Extent of the intersection.
+    size: Vec<usize>,
+}
+
 /// An HDF5 dataset, opened and ready to read.
 ///
 /// Holds only the dataset's metadata — its dataspace, datatype, storage layout
@@ -98,6 +108,10 @@ fn copy_region_inner(
 /// range read fetches only the bytes it needs: the overlapping chunks of a
 /// chunked dataset, or the enclosing byte span of a contiguous one.
 pub struct Dataset {
+    /// The chunk index, once walked. Reading several ranges out of one dataset
+    /// is a common pattern, and re-walking the index for each of them would
+    /// cost round trips for a list that cannot change.
+    chunks: std::sync::Mutex<Option<std::sync::Arc<Vec<ChunkRecord>>>>,
     pub(crate) name: String,
     pub(crate) dataspace: DataspaceMessage,
     pub(crate) datatype: DatatypeMessage,
@@ -110,6 +124,26 @@ pub struct Dataset {
 }
 
 impl Dataset {
+    /// Assemble a dataset from the messages of its object header.
+    pub(crate) fn new(
+        name: String,
+        dataspace: DataspaceMessage,
+        datatype: DatatypeMessage,
+        layout: DataLayoutMessage,
+        filter: Option<FilterMessage>,
+        attributes: Vec<AttributeMessage>,
+    ) -> Dataset {
+        Dataset {
+            chunks: Default::default(),
+            name,
+            dataspace,
+            datatype,
+            layout,
+            filter,
+            attributes,
+        }
+    }
+
     /// The dataset's name (its last path segment).
     pub fn name(&self) -> &str {
         &self.name
@@ -187,7 +221,6 @@ impl Dataset {
 
     /// The chunked layout, or an error naming the layout this dataset actually
     /// uses.
-    #[cfg(test)]
     fn chunked_layout(&self) -> H5Result<&ChunkedLayout> {
         self.layout.chunked().ok_or_else(|| {
             H5Error::corrupt(format!("dataset is {}, not chunked", self.layout_name()))
@@ -278,15 +311,15 @@ impl Dataset {
         Ok(decoded)
     }
 
-    /// Decode a chunk and copy the specified sub-region directly into `dst`.
-    /// For unfiltered data, copies directly from the fetched bytes into `dst`
-    /// with no intermediate buffer.
+    /// Decode an already-fetched chunk and copy the specified sub-region
+    /// directly into `dst`. Unfiltered data is copied straight from the fetched
+    /// bytes with no intermediate buffer.
     #[allow(clippy::too_many_arguments)]
-    async fn read_chunk_into<T: H5Type>(
+    fn copy_chunk_into<T: H5Type>(
         &self,
         layout: &ChunkedLayout,
         c: &ChunkRecord,
-        file: &ObjectStoreFile,
+        stored: &[u8],
         chunk_shape: &[usize],
         src_start: &[usize],
         dst: &mut [T],
@@ -297,62 +330,39 @@ impl Dataset {
         let elem_size = std::mem::size_of::<T>();
         let uncompressed_bytes = layout.chunk_bytes() as usize;
 
-        if self.filter.is_none() {
-            // Unfiltered: fetch bytes and copy sub-region directly into dst.
-            // No intermediate Vec<T> needed.
+        let decoded = if self.filter.is_none() {
             if uncompressed_bytes != c.size as usize {
                 return Err(H5Error::corrupt(format!(
                     "unfiltered chunk at {} records {} bytes but its layout implies {}",
                     c.address, c.size, uncompressed_bytes
                 )));
             }
-            let bytes = fetch_exact(file, c.address, uncompressed_bytes as u64).await?;
-
-            let src_strides = row_major_strides(chunk_shape);
-            let dst_strides = row_major_strides(dst_shape);
-            copy_region_inner(
-                &bytes,
-                elem_size,
-                &src_strides,
-                src_start,
-                bytemuck::cast_slice_mut(dst),
-                &dst_strides,
-                dst_start,
-                size,
-                0,
-            );
+            None
         } else {
-            // Filtered: run the pipeline backwards into a temp buffer, then copy
-            // the sub-region out of it.
-            let stored = fetch_exact(file, c.address, c.size).await?;
-            let decoded = self.decode_filters(layout, c, &stored, uncompressed_bytes)?;
-            let data: &[u8] = decoded.as_deref().unwrap_or(&stored);
+            self.decode_filters(layout, c, stored, uncompressed_bytes)?
+        };
+        let data: &[u8] = decoded.as_deref().unwrap_or(stored);
 
-            if data.len() != uncompressed_bytes {
-                return Err(H5Error::corrupt(format!(
-                    "chunk at {} decoded to {} bytes, expected {}",
-                    c.address,
-                    data.len(),
-                    uncompressed_bytes
-                )));
-            }
-
-            // Copy sub-region from decompressed bytes directly into dst
-            let src_strides = row_major_strides(chunk_shape);
-            let dst_strides = row_major_strides(dst_shape);
-            copy_region_inner(
-                data,
-                elem_size,
-                &src_strides,
-                src_start,
-                bytemuck::cast_slice_mut(dst),
-                &dst_strides,
-                dst_start,
-                size,
-                0,
-            );
+        if data.len() != uncompressed_bytes {
+            return Err(H5Error::corrupt(format!(
+                "chunk at {} decoded to {} bytes, expected {}",
+                c.address,
+                data.len(),
+                uncompressed_bytes
+            )));
         }
 
+        copy_region_inner(
+            data,
+            elem_size,
+            &row_major_strides(chunk_shape),
+            src_start,
+            bytemuck::cast_slice_mut(dst),
+            &row_major_strides(dst_shape),
+            dst_start,
+            size,
+            0,
+        );
         Ok(())
     }
 
@@ -463,13 +473,17 @@ impl Dataset {
 
         let dataset_dims = self.dataset_dims();
         let chunk_dims: Vec<usize> = layout.chunk_dims.iter().map(|&d| d as usize).collect();
-        let all_chunks = enumerate_chunks(file, layout, dataset_dims).await?;
+        let all_chunks = self.collect_chunks(file).await?;
 
-        for chunk_ptr in &all_chunks {
-            let chunk_offset: &[u64] = &chunk_ptr.offsets;
+        // Work out which chunks contribute, and where, before fetching any of
+        // them: knowing the whole list up front is what lets the reads be
+        // batched into a few requests instead of one per chunk.
+        let mut wanted: Vec<(&ChunkRecord, ChunkCopy)> = vec![];
+        for chunk in all_chunks.iter() {
+            let chunk_offset: &[u64] = &chunk.offsets;
 
-            // Compute intersection of chunk region with selection (in global coords),
-            // clamping chunk extent to the dataset boundary for edge chunks.
+            // Intersect the chunk with the selection in global coordinates,
+            // clamping the chunk extent to the dataset boundary for edge chunks.
             let mut intersects = true;
             let mut global_start = vec![0u64; ndim];
             let mut global_end = vec![0u64; ndim];
@@ -486,28 +500,56 @@ impl Dataset {
                 continue;
             }
 
-            let chunk_local_start: Vec<usize> = (0..ndim)
-                .map(|d| (global_start[d] - chunk_offset[d]) as usize)
-                .collect();
-            let output_start: Vec<usize> = (0..ndim)
-                .map(|d| (global_start[d] - sel[d].start) as usize)
-                .collect();
-            let inter_size: Vec<usize> = (0..ndim)
-                .map(|d| (global_end[d] - global_start[d]) as usize)
-                .collect();
+            wanted.push((
+                chunk,
+                ChunkCopy {
+                    src_start: (0..ndim)
+                        .map(|d| (global_start[d] - chunk_offset[d]) as usize)
+                        .collect(),
+                    dst_start: (0..ndim)
+                        .map(|d| (global_start[d] - sel[d].start) as usize)
+                        .collect(),
+                    size: (0..ndim)
+                        .map(|d| (global_end[d] - global_start[d]) as usize)
+                        .collect(),
+                },
+            ));
+        }
 
-            self.read_chunk_into(
-                layout,
-                chunk_ptr,
-                file,
-                &chunk_dims,
-                &chunk_local_start,
-                output,
-                output_shape,
-                &output_start,
-                &inter_size,
-            )
-            .await?;
+        // Fetch in batches, so that a read spanning thousands of chunks still
+        // costs a handful of requests without holding the whole dataset twice.
+        let max_batch_bytes = file.options().max_batch_bytes.max(1);
+        let mut start = 0;
+        while start < wanted.len() {
+            let mut end = start;
+            let mut batch_bytes = 0u64;
+            while end < wanted.len()
+                && (end == start || batch_bytes + wanted[end].0.size <= max_batch_bytes)
+            {
+                batch_bytes += wanted[end].0.size;
+                end += 1;
+            }
+
+            let ranges: Vec<Range<u64>> = wanted[start..end]
+                .iter()
+                .map(|(c, _)| c.address..c.address + c.size)
+                .collect();
+            let blobs = file.read_ranges(&ranges).await?;
+
+            for ((chunk, copy), stored) in wanted[start..end].iter().zip(&blobs) {
+                self.copy_chunk_into(
+                    layout,
+                    chunk,
+                    stored,
+                    &chunk_dims,
+                    &copy.src_start,
+                    output,
+                    output_shape,
+                    &copy.dst_start,
+                    &copy.size,
+                )?;
+            }
+            start = end;
         }
         Ok(())
     }
@@ -535,7 +577,7 @@ impl Dataset {
         let dst: &mut [u8] = bytemuck::cast_slice_mut(output);
 
         if self.ndim() == 0 {
-            let bytes = fetch_exact(file, address, elem_size as u64).await?;
+            let bytes = fetch_data(file, address, elem_size as u64).await?;
             dst[..elem_size].copy_from_slice(&bytes[..elem_size]);
             return Ok(());
         }
@@ -559,7 +601,7 @@ impl Dataset {
             )));
         }
 
-        let bytes = fetch_exact(
+        let bytes = fetch_data(
             file,
             address + (first * elem_size) as u64,
             (span * elem_size) as u64,
@@ -621,14 +663,22 @@ impl Dataset {
         Ok(())
     }
 
-    /// Walk the chunk index and collect a record for every allocated chunk.
-    #[cfg(test)]
+    /// Walk the chunk index and collect a record for every allocated chunk,
+    /// reusing the result of any earlier walk.
     pub(crate) async fn collect_chunks(
         &self,
         file: &ObjectStoreFile,
-    ) -> H5Result<Vec<ChunkRecord>> {
+    ) -> H5Result<std::sync::Arc<Vec<ChunkRecord>>> {
+        if let Some(chunks) = self.chunks.lock().expect("chunk cache poisoned").as_ref() {
+            return Ok(chunks.clone());
+        }
+
         let layout = self.chunked_layout()?;
-        enumerate_chunks(file, layout, self.dataset_dims()).await
+        let chunks =
+            std::sync::Arc::new(enumerate_chunks(file, layout, self.dataset_dims()).await?);
+        // A concurrent walk may have finished first; either result is the same.
+        *self.chunks.lock().expect("chunk cache poisoned") = Some(chunks.clone());
+        Ok(chunks)
     }
 }
 
