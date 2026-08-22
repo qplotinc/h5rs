@@ -47,6 +47,14 @@ hdf5 = { package = "hdf5-metno", version = "0.14", features = [
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 chrono = { version = "0.4", features = ["wasmbind"] }
+wasm-bindgen = "0.2"
+# Just enough of the web platform to hand control back to the host between
+# chunks; see `compute::host_yield`.
+web-sys = { version = "0.3", features = [
+    "MessageChannel",
+    "MessageEvent",
+    "MessagePort",
+] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 async-trait = "0.1"

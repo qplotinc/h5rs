@@ -583,21 +583,21 @@ async fn request_size() {
         ),
     ] {
         println!("\n{name}\n");
-        for max_request_bytes in [
+        for max_coalesced_bytes in [
             512 * 1024,
             2 * 1024 * 1024,
             8 * 1024 * 1024,
             32 * 1024 * 1024,
         ] {
             let options = ReadOptions {
-                max_request_bytes,
+                max_coalesced_bytes,
                 ..ReadOptions::default()
             };
             let report = measure(Scenario {
                 label: format!(
                     "request <= {:>4} KiB (<= {:>4} MiB in flight)",
-                    max_request_bytes / 1024,
-                    max_request_bytes as usize * options.io_concurrency / (1024 * 1024)
+                    max_coalesced_bytes / 1024,
+                    max_coalesced_bytes as usize * options.io_concurrency / (1024 * 1024)
                 ),
                 fixture,
                 latency,
@@ -611,7 +611,7 @@ async fn request_size() {
     }
 }
 
-/// `max_request_bytes` decides when neighbouring chunks are worth combining —
+/// `max_coalesced_bytes` decides when neighbouring chunks are worth combining —
 /// it never splits one.
 ///
 /// A chunk always arrives in a single request at its full stored size, however
@@ -626,13 +626,13 @@ async fn a_chunk_is_always_one_request() {
     let path = fixture.path.canonicalize().unwrap();
     let stored = fixture.stored_bytes();
 
-    for max_request_bytes in [512 * 1024, 8 * 1024 * 1024] {
+    for max_coalesced_bytes in [512 * 1024, 8 * 1024 * 1024] {
         let store = LocalFileSystem::new_with_prefix(path.parent().unwrap()).unwrap();
         let file = ObjectStoreFile::with_options(
             Box::new(store),
             Path::from(path.file_name().unwrap().to_str().unwrap()),
             ReadOptions {
-                max_request_bytes,
+                max_coalesced_bytes,
                 ..ReadOptions::default()
             },
         );
@@ -651,15 +651,15 @@ async fn a_chunk_is_always_one_request() {
         // request per chunk, and never more bytes than the file holds.
         assert!(
             requests <= 8,
-            "cap {max_request_bytes}: {requests} requests for 8 chunks — a chunk was split"
+            "cap {max_coalesced_bytes}: {requests} requests for 8 chunks — a chunk was split"
         );
         assert!(
             bytes <= stored,
-            "cap {max_request_bytes}: fetched {bytes} bytes for a {stored}-byte file"
+            "cap {max_coalesced_bytes}: fetched {bytes} bytes for a {stored}-byte file"
         );
         println!(
             "cap {:>5} KiB: {requests} requests, {bytes} bytes",
-            max_request_bytes / 1024
+            max_coalesced_bytes / 1024
         );
     }
 }
@@ -679,7 +679,7 @@ async fn yields_to_the_host_while_decoding() {
 
     let yields = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counted = yields.clone();
-    let pool = YieldingCompute::new(Arc::new(InlineCompute), 8 << 20, move || {
+    let pool = YieldingCompute::with_yield(Arc::new(InlineCompute), 8 << 20, move || {
         counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Box::pin(yield_now())
     });

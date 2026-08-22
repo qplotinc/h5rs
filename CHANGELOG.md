@@ -49,14 +49,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   WASM; `ThreadPoolCompute` spreads it over OS threads without needing an async
   runtime; anything else is a two-method trait.
 - `compute::YieldingCompute` hands control back to a single-threaded host
-  between chunks, roughly every N decoded bytes, using a yield the host
-  supplies — decompression has no await points inside it, so without this a
-  large read holds the thread until every chunk is done. On `wasm32` neither
-  the pool nor its futures need to be `Send`, so a pool built from JS promises
-  or workers fits the trait.
-- `ReadOptions` gains `io_concurrency`, `max_request_bytes` and
+  between chunks, roughly every N decoded bytes — decompression has no await
+  points inside it, so without this a large read holds the thread until every
+  chunk is done. `compute::host_yield` posts through a `MessageChannel` on the
+  web, ending the current task so the browser can paint, and
+  `YieldingCompute::with_yield` takes a yield of the host's own. On `wasm32`
+  neither the pool nor its futures need to be `Send`, so one built from JS
+  promises or workers fits the trait.
+- `ReadOptions` gains `io_concurrency`, `max_coalesced_bytes` and
   `max_inflight_bytes`, which together decide how well a high-latency link is
-  saturated and how much memory a read holds.
+  saturated and how much memory a read holds. `max_coalesced_bytes` is a
+  ceiling on merging neighbouring ranges, not on request size: a chunk is
+  always fetched whole, however large.
 - A `dump` example that lists a file's datasets and reads one.
 
 ### Changed

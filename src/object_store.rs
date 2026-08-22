@@ -59,13 +59,18 @@ pub struct ReadOptions {
     /// Upper bound on the metadata block cache, in bytes. Once reached, the
     /// least recently used blocks are dropped.
     pub cache_capacity: u64,
-    /// How far adjacent chunks are merged into one request.
+    /// How large a merged request is allowed to grow.
     ///
-    /// A chunk larger than this still gets its own request; this only decides
-    /// when neighbours are worth combining. Bigger requests amortise latency,
-    /// but nothing in a request can be decoded until all of it has arrived, so
-    /// oversized ones starve the decoder at the start of a read.
-    pub max_request_bytes: u64,
+    /// This is a ceiling on *coalescing*, not on request size: it decides when
+    /// neighbouring ranges stop being worth combining. A single range larger
+    /// than this is still fetched whole in one request — a chunk is never split
+    /// across requests, since none of it could be decoded until every piece
+    /// arrived.
+    ///
+    /// Merging saves round trips, but nothing in a request can be decoded until
+    /// all of it has landed, so merging too eagerly starves the decoder at the
+    /// start of a read.
+    pub max_coalesced_bytes: u64,
     /// How many bulk requests to keep in flight at once.
     ///
     /// This is what saturates a high-latency link: with a round trip of `t` and
@@ -79,7 +84,8 @@ pub struct ReadOptions {
     /// a chunk bigger than the ceiling is still readable.
     pub max_inflight_bytes: u64,
     /// Two wanted ranges no further apart than this are fetched as one request,
-    /// paying for the bytes in between to save a round trip.
+    /// paying for the bytes in between to save a round trip. Bounded by
+    /// [`max_coalesced_bytes`](Self::max_coalesced_bytes).
     ///
     /// Adjacent chunks have no gap at all, so this only decides how much
     /// unwanted data is worth pulling to avoid a request. Set it near
@@ -92,7 +98,7 @@ impl Default for ReadOptions {
         ReadOptions {
             metadata_block_size: 512 * 1024,
             cache_capacity: 32 * 1024 * 1024,
-            max_request_bytes: 512 * 1024,
+            max_coalesced_bytes: 512 * 1024,
             io_concurrency: 16,
             max_inflight_bytes: 32 * 1024 * 1024,
             coalesce_gap: 64 * 1024,
@@ -364,7 +370,7 @@ impl ObjectStoreFile {
         let merged = merge_ranges(
             ranges,
             self.options.coalesce_gap,
-            self.options.max_request_bytes,
+            self.options.max_coalesced_bytes,
         );
         let clamped: Vec<Option<Range<u64>>> =
             merged.iter().map(|r| self.clamp(r.clone())).collect();

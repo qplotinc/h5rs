@@ -487,7 +487,7 @@ impl Dataset {
         }
 
         let options = file.options();
-        let groups = group_requests(wanted, options.coalesce_gap, options.max_request_bytes);
+        let groups = group_requests(wanted, options.coalesce_gap, options.max_coalesced_bytes);
         let pool = file.compute().clone();
         let uncompressed = layout.chunk_bytes() as usize;
 
@@ -758,18 +758,22 @@ struct RequestGroup {
 /// Group the wanted chunks into requests.
 ///
 /// Chunks that sit next to each other on disk are fetched together, since the
-/// gap between them costs less than another round trip — but only up to
-/// `max_bytes`, because nothing in a request can be decoded until all of it has
-/// landed.
+/// gap between them costs less than another round trip — but only while the
+/// merged span stays under `max_coalesced`, because nothing in a request can be
+/// decoded until all of it has landed.
+///
+/// A chunk always lands in exactly one request, at its full stored size, even
+/// when that is larger than `max_coalesced`: the ceiling gates merging a
+/// neighbour in, never splitting a chunk up.
 fn group_requests(
     wanted: &[(&ChunkRecord, ChunkCopy)],
     gap: u64,
-    max_bytes: u64,
+    max_coalesced: u64,
 ) -> Vec<RequestGroup> {
     let mut order: Vec<usize> = (0..wanted.len()).collect();
     order.sort_unstable_by_key(|&i| wanted[i].0.address);
 
-    let max_bytes = max_bytes.max(1);
+    let max_coalesced = max_coalesced.max(1);
     let mut groups: Vec<RequestGroup> = vec![];
     for index in order {
         let chunk = wanted[index].0;
@@ -777,7 +781,7 @@ fn group_requests(
         match groups.last_mut() {
             Some(last)
                 if range.start <= last.range.end.saturating_add(gap)
-                    && range.end.saturating_sub(last.range.start) <= max_bytes =>
+                    && range.end.saturating_sub(last.range.start) <= max_coalesced =>
             {
                 last.range.end = last.range.end.max(range.end);
                 last.members.push(index);

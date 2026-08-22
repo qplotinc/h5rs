@@ -146,20 +146,15 @@ impl<T: Fn() -> YieldFuture + 'static> YieldSource for T {}
 /// pool and, once roughly `yield_after_bytes` have been decoded, waits on a
 /// future the host supplies before letting the next chunk through.
 ///
-/// What that future *is* has to come from the host, because only the host knows
-/// what yielding means to it. In a browser it should be something that gives up
-/// the current task — `setTimeout(0)`, a `MessageChannel` message, or
-/// `scheduler.yield()` where available. A microtask (`queueMicrotask`, or an
-/// immediately-resolved promise) is **not** enough: microtasks run before the
-/// browser can paint or handle input, so yielding to one changes nothing that
-/// the user can see.
+/// [`new`](Self::new) uses [`host_yield`], which on the web ends the current
+/// task so the browser can paint and handle input. [`with_yield`](Self::with_yield)
+/// takes a future of the host's own instead.
 ///
 /// ```
 /// use std::sync::Arc;
-/// use h5rs::compute::{InlineCompute, YieldingCompute, yield_now};
+/// use h5rs::compute::{InlineCompute, YieldingCompute};
 ///
-/// // On a browser, replace `yield_now` with a `setTimeout(0)` promise.
-/// let pool = YieldingCompute::new(Arc::new(InlineCompute), 4 << 20, || Box::pin(yield_now()));
+/// let pool = YieldingCompute::new(Arc::new(InlineCompute), 4 << 20);
 /// ```
 pub struct YieldingCompute {
     inner: Arc<dyn ComputePool>,
@@ -178,14 +173,20 @@ impl Debug for YieldingCompute {
 }
 
 impl YieldingCompute {
-    /// Wrap `inner`, yielding roughly every `yield_after_bytes` of decoded
-    /// output.
+    /// Wrap `inner`, yielding to the host roughly every `yield_after_bytes` of
+    /// decoded output using [`host_yield`].
     ///
     /// The count is of decompressed bytes, so the gap between yields is bounded
     /// in work done rather than in chunks — a dataset with one huge chunk and
     /// one with many small ones yield at about the same rate. A chunk is never
     /// interrupted part-way, so in practice the gap is at least one chunk.
-    pub fn new(
+    pub fn new(inner: Arc<dyn ComputePool>, yield_after_bytes: u64) -> YieldingCompute {
+        YieldingCompute::with_yield(inner, yield_after_bytes, host_yield)
+    }
+
+    /// As [`new`](Self::new), but yielding through a future of the host's own —
+    /// `scheduler.yield()`, `requestIdleCallback`, a hand-off to a worker.
+    pub fn with_yield(
         inner: Arc<dyn ComputePool>,
         yield_after_bytes: u64,
         make_yield: impl YieldSource,
@@ -235,10 +236,9 @@ impl ComputePool for YieldingCompute {
 /// Give the executor a chance to run something else.
 ///
 /// Returns `Pending` once, waking immediately. That is enough on a native
-/// executor, and on WASM it defers to the next microtask — which lets other
-/// pending futures run but still does **not** let the browser paint. For that,
-/// give [`YieldingCompute`] a future built from `setTimeout` or
-/// `scheduler.yield()` instead.
+/// executor. On the web it only defers to the next *microtask*, which lets
+/// other pending futures run but still does not let the browser paint or
+/// handle input — use [`host_yield`] there instead.
 pub async fn yield_now() {
     let mut yielded = false;
     std::future::poll_fn(move |cx| {
@@ -251,6 +251,54 @@ pub async fn yield_now() {
         }
     })
     .await
+}
+
+/// The best yield available on this target.
+///
+/// Natively this is [`yield_now`]. On the web it posts a message to a
+/// [`MessageChannel`] and waits for it to come back, which ends the current
+/// task and lets the browser paint, handle input and run other work before
+/// resuming — unlike a microtask, which runs before any of that can happen.
+///
+/// A host that would rather use `scheduler.yield()`, `requestIdleCallback` or a
+/// worker can pass its own future to [`YieldingCompute::with_yield`].
+///
+/// [`MessageChannel`]: https://developer.mozilla.org/docs/Web/API/MessageChannel
+#[cfg(not(target_arch = "wasm32"))]
+pub fn host_yield() -> YieldFuture {
+    Box::pin(yield_now())
+}
+
+/// The best yield available on this target. See the native definition.
+#[cfg(target_arch = "wasm32")]
+pub fn host_yield() -> YieldFuture {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::prelude::JsValue;
+
+    let Ok(channel) = web_sys::MessageChannel::new() else {
+        // No MessageChannel here — a microtask is all that is left.
+        return Box::pin(yield_now());
+    };
+    let (sender, receiver) = futures_channel::oneshot::channel();
+
+    let port1 = channel.port1();
+    let on_message = Closure::once(move |_: web_sys::MessageEvent| {
+        let _ = sender.send(());
+    });
+    port1.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+
+    if channel.port2().post_message(&JsValue::NULL).is_err() {
+        return Box::pin(yield_now());
+    }
+
+    Box::pin(async move {
+        let _ = receiver.await;
+        // Keep the callback and the port alive until the message has arrived,
+        // then let both go.
+        port1.set_onmessage(None);
+        drop(on_message);
+    })
 }
 
 /// The pool h5rs uses when the caller has not chosen one.
@@ -333,5 +381,65 @@ impl ComputePool for ThreadPoolCompute {
 
     fn parallelism(&self) -> usize {
         self.threads
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A microtask resolves before the host yield does.
+    ///
+    /// This is the whole point of [`host_yield`] on the web: a microtask runs
+    /// before the browser can paint, so a yield that only reached a microtask
+    /// would be no yield at all. Joining the two makes the ordering observable.
+    #[cfg(target_arch = "wasm32")]
+    #[crate::async_test]
+    async fn host_yield_comes_after_a_microtask() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let (micro, host) = (order.clone(), order.clone());
+
+        futures_util::future::join(
+            async move {
+                yield_now().await;
+                micro.borrow_mut().push("microtask");
+            },
+            async move {
+                host_yield().await;
+                host.borrow_mut().push("host");
+            },
+        )
+        .await;
+
+        assert_eq!(*order.borrow(), vec!["microtask", "host"]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[crate::async_test]
+    async fn yields_resolve() {
+        yield_now().await;
+        host_yield().await;
+    }
+
+    /// The wrapper yields at the requested interval and leaves results intact.
+    #[crate::async_test]
+    async fn yielding_pool_yields_on_schedule() {
+        let count = Arc::new(AtomicU64::new(0));
+        let counted = count.clone();
+        let pool = YieldingCompute::with_yield(Arc::new(InlineCompute), 1024, move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Box::pin(yield_now())
+        });
+
+        // Ten jobs of 512 bytes each: a yield is owed after every second one.
+        for i in 0..10u8 {
+            let decoded = pool.run(Box::new(move || Ok(vec![i; 512]))).await.unwrap();
+            assert_eq!(decoded.len(), 512);
+            assert_eq!(decoded[0], i);
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 4);
     }
 }

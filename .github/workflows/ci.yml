@@ -66,6 +66,24 @@ jobs:
       # are native-only, so they are excluded rather than checked here.
       - run: cargo check --target wasm32-unknown-unknown --lib --tests
 
+      # Run the tests that exercise wasm-specific code — `compute::host_yield`
+      # posts through a MessageChannel, which cannot be checked by compiling.
+      # The test runner must match the locked wasm-bindgen exactly.
+      - id: wasm-bindgen-version
+        run: |
+          version=$(cargo metadata --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name=="wasm-bindgen") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@${{ steps.wasm-bindgen-version.outputs.version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # The dataset-driven tests need sample files that are not in the repo, so
+      # only the self-contained ones run here.
+      - run: cargo test --target wasm32-unknown-unknown --lib compute
+
   docs:
     name: rustdoc
     runs-on: ubuntu-latest

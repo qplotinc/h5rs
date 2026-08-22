@@ -2433,10 +2433,10 @@ mod test {
         println!("{:-<62}", "");
         for (name, workload) in workloads(&dense_path, &spread_path) {
             let mut row = String::new();
-            for (max_request_bytes, io_concurrency) in [(1, 1), (8 * 1024 * 1024, 16)] {
+            for (max_coalesced_bytes, io_concurrency) in [(1, 1), (8 * 1024 * 1024, 16)] {
                 let options = ReadOptions {
                     metadata_block_size: 128 * KIB,
-                    max_request_bytes,
+                    max_coalesced_bytes,
                     io_concurrency,
                     ..ReadOptions::default()
                 };

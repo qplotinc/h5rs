@@ -74,17 +74,17 @@ Reading compressed chunks is two kinds of work at once, and h5rs pipelines them:
 
 Where the decompression runs is your choice, because it depends on the host. The default runs it on the async task — still overlapped with I/O, but one core. `ThreadPoolCompute` spreads it over OS threads and needs no async runtime; anything else (Rayon, a Tokio blocking pool, web workers) is a two-method `ComputePool` trait.
 
-On a single-threaded host, decompression has no await points in it, so a long read would hold the thread until every chunk is done. `YieldingCompute` waits on a future you supply once roughly every N decoded bytes:
+On a single-threaded host, decompression has no await points in it, so a long read would hold the thread until every chunk is done. `YieldingCompute` hands control back roughly every N decoded bytes:
 
 ```rust
 use h5rs::compute::{InlineCompute, YieldingCompute};
 
-// In a browser, build the yield from `setTimeout(0)` or `scheduler.yield()`.
-// A microtask is not enough — those run before the browser can paint.
-let pool = YieldingCompute::new(Arc::new(InlineCompute), 4 << 20, || Box::pin(host_yield()));
+let pool = YieldingCompute::new(Arc::new(InlineCompute), 4 << 20);
 ```
 
-On `wasm32` the `ComputePool` future and the yield are not required to be `Send`, so a pool built out of JS promises or workers fits the trait as-is.
+On the web that yield posts through a `MessageChannel`, which ends the current task so the browser can paint and handle input — unlike a microtask, which runs before any of that can happen. Pass your own future to `YieldingCompute::with_yield` to use `scheduler.yield()`, `requestIdleCallback`, or a worker instead.
+
+On `wasm32` neither the pool nor its futures need to be `Send`, so one built out of JS promises or workers fits the trait as-is.
 
 ```rust
 use h5rs::compute::ThreadPoolCompute;
