@@ -48,6 +48,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `InlineCompute` (the default) runs it on the async task, which is right for
   WASM; `ThreadPoolCompute` spreads it over OS threads without needing an async
   runtime; anything else is a two-method trait.
+- `compute::YieldingCompute` hands control back to a single-threaded host
+  between chunks, roughly every N decoded bytes, using a yield the host
+  supplies — decompression has no await points inside it, so without this a
+  large read holds the thread until every chunk is done. On `wasm32` neither
+  the pool nor its futures need to be `Send`, so a pool built from JS promises
+  or workers fits the trait.
 - `ReadOptions` gains `io_concurrency`, `max_request_bytes` and
   `max_inflight_bytes`, which together decide how well a high-latency link is
   saturated and how much memory a read holds.

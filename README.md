@@ -72,7 +72,19 @@ Two things get it there. Metadata is read in aligned blocks (512 KiB by default)
 
 Reading compressed chunks is two kinds of work at once, and h5rs pipelines them: requests stay in flight while each one that lands is decompressed and copied into the output. Whichever resource is scarcer sets the pace and the other disappears behind it.
 
-Where the decompression runs is your choice, because it depends on the host. The default runs it on the async task — right for a browser, and still overlapped with I/O, but one core. `ThreadPoolCompute` spreads it over OS threads and needs no async runtime; anything else (Rayon, a Tokio blocking pool, web workers) is a two-method `ComputePool` trait.
+Where the decompression runs is your choice, because it depends on the host. The default runs it on the async task — still overlapped with I/O, but one core. `ThreadPoolCompute` spreads it over OS threads and needs no async runtime; anything else (Rayon, a Tokio blocking pool, web workers) is a two-method `ComputePool` trait.
+
+On a single-threaded host, decompression has no await points in it, so a long read would hold the thread until every chunk is done. `YieldingCompute` waits on a future you supply once roughly every N decoded bytes:
+
+```rust
+use h5rs::compute::{InlineCompute, YieldingCompute};
+
+// In a browser, build the yield from `setTimeout(0)` or `scheduler.yield()`.
+// A microtask is not enough — those run before the browser can paint.
+let pool = YieldingCompute::new(Arc::new(InlineCompute), 4 << 20, || Box::pin(host_yield()));
+```
+
+On `wasm32` the `ComputePool` future and the yield are not required to be `Send`, so a pool built out of JS promises or workers fits the trait as-is.
 
 ```rust
 use h5rs::compute::ThreadPoolCompute;

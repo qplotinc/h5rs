@@ -611,6 +611,103 @@ async fn request_size() {
     }
 }
 
+/// `max_request_bytes` decides when neighbouring chunks are worth combining —
+/// it never splits one.
+///
+/// A chunk always arrives in a single request at its full stored size, however
+/// large it is. Turning this cap into something that splits chunks would be a
+/// serious regression: a partially-arrived chunk cannot be decoded, so the
+/// pieces would have to be reassembled before any progress could be made.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chunk_is_always_one_request() {
+    // 8 chunks of 4 MiB uncompressed, each storing far more than the 512 KiB
+    // default cap.
+    let fixture = Fixture::build(8 * 1024 * 1024, 1024 * 1024);
+    let path = fixture.path.canonicalize().unwrap();
+    let stored = fixture.stored_bytes();
+
+    for max_request_bytes in [512 * 1024, 8 * 1024 * 1024] {
+        let store = LocalFileSystem::new_with_prefix(path.parent().unwrap()).unwrap();
+        let file = ObjectStoreFile::with_options(
+            Box::new(store),
+            Path::from(path.file_name().unwrap().to_str().unwrap()),
+            ReadOptions {
+                max_request_bytes,
+                ..ReadOptions::default()
+            },
+        );
+
+        let ds = h5rs::open_dataset(&file, &["data"]).await.unwrap().unwrap();
+        let before = file.stats();
+        let values = ds.read_full::<u32>(&file).await.unwrap();
+        assert_eq!(values.data.len(), fixture.values);
+
+        let after = file.stats();
+        let requests = after.requests - before.requests;
+        let bytes = after.bytes_fetched - before.bytes_fetched;
+
+        // Eight chunks, each bigger than the smaller cap: one request each when
+        // the cap forbids merging, fewer once it allows it. Never more than one
+        // request per chunk, and never more bytes than the file holds.
+        assert!(
+            requests <= 8,
+            "cap {max_request_bytes}: {requests} requests for 8 chunks — a chunk was split"
+        );
+        assert!(
+            bytes <= stored,
+            "cap {max_request_bytes}: fetched {bytes} bytes for a {stored}-byte file"
+        );
+        println!(
+            "cap {:>5} KiB: {requests} requests, {bytes} bytes",
+            max_request_bytes / 1024
+        );
+    }
+}
+
+/// A single-threaded host gets control back periodically during a long read.
+///
+/// Decompression has no await points inside it, so the only place a yield can
+/// happen is between chunks. What matters is that it happens often enough that
+/// no single stretch of held thread is long in terms of bytes decoded.
+#[tokio::test(flavor = "current_thread")]
+async fn yields_to_the_host_while_decoding() {
+    use h5rs::compute::{YieldingCompute, yield_now};
+
+    // 64 MiB of output in 32 chunks of 2 MiB.
+    let fixture = Fixture::build(16 * 1024 * 1024, 524_288);
+    let path = fixture.path.canonicalize().unwrap();
+
+    let yields = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = yields.clone();
+    let pool = YieldingCompute::new(Arc::new(InlineCompute), 8 << 20, move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Box::pin(yield_now())
+    });
+
+    let store = LocalFileSystem::new_with_prefix(path.parent().unwrap()).unwrap();
+    let file = ObjectStoreFile::new(
+        Box::new(store),
+        Path::from(path.file_name().unwrap().to_str().unwrap()),
+    )
+    .with_compute(Arc::new(pool));
+
+    let ds = h5rs::open_dataset(&file, &["data"]).await.unwrap().unwrap();
+    let values = ds.read_full::<u32>(&file).await.unwrap();
+    assert_eq!(values.data.len(), fixture.values);
+
+    // 64 MiB decoded, yielding every 8 MiB: about seven breaks, and certainly
+    // neither none nor one per chunk.
+    let count = yields.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        (4..=12).contains(&count),
+        "expected roughly 7 yields over 64 MiB at 8 MiB apart, got {count}"
+    );
+
+    // The data still has to be right: yielding must not reorder or drop chunks.
+    let expected = sample_data(values.data.len());
+    assert_eq!(values.data, expected);
+}
+
 /// The property those measurements are about: decoding overlaps downloading.
 ///
 /// If the reader fetched everything and only then decoded, no decode interval

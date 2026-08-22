@@ -69,11 +69,14 @@
 //! Where the decompression runs is the caller's choice, because it depends
 //! entirely on the host — see [`compute`]. The default runs it on the async
 //! task, which still overlaps with I/O but uses one core; handing h5rs a
-//! [`ThreadPoolCompute`] or a pool of your own spreads it over many.
+//! [`ThreadPoolCompute`] or a pool of your own spreads it over many, and
+//! [`YieldingCompute`] hands control back to a single-threaded host between
+//! chunks so a long read does not freeze it.
 //!
 //! [`ObjectStoreFile::stats`]: crate::object_store::ObjectStoreFile::stats
 //! [`ReadOptions`]: crate::object_store::ReadOptions
 //! [`ThreadPoolCompute`]: crate::compute::ThreadPoolCompute
+//! [`YieldingCompute`]: crate::compute::YieldingCompute
 //!
 //! # Errors
 //!
