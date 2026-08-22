@@ -68,6 +68,32 @@ Over object storage a request costs far more than the bytes it carries, so h5rs 
 
 Two things get it there. Metadata is read in aligned blocks (512 KiB by default), so following a pointer to a nearby structure usually costs no further request. And wherever a set of addresses is known at once — a B-tree level, a group's object headers, the chunks a selection overlaps — they are fetched together: merged into one request where they lie close, issued in parallel where they do not.
 
+### Overlapping I/O and decompression
+
+Reading compressed chunks is two kinds of work at once, and h5rs pipelines them: requests stay in flight while each one that lands is decompressed and copied into the output. Whichever resource is scarcer sets the pace and the other disappears behind it.
+
+Where the decompression runs is your choice, because it depends on the host. The default runs it on the async task — right for a browser, and still overlapped with I/O, but one core. `ThreadPoolCompute` spreads it over OS threads and needs no async runtime; anything else (Rayon, a Tokio blocking pool, web workers) is a two-method `ComputePool` trait.
+
+```rust
+use h5rs::compute::ThreadPoolCompute;
+use std::sync::Arc;
+
+let file = ObjectStoreFile::new(Box::new(store), Path::from("matrix.h5"))
+    .with_compute(Arc::new(ThreadPoolCompute::with_available_parallelism()));
+```
+
+Measured against a simulated link (`cargo test --features hdf5-compare --test pipeline -- --ignored --nocapture`):
+
+| scenario | limit | wall | ideal | limiting resource used |
+|---|---|---|---|---|
+| 200 MiB / 50 chunks over 30 MB/s, 50 ms latency, 1 core | link | 3.58 s | 3.51 s | 98% |
+| 512 MiB / 100 chunks from 2 GB/s flash, 1 core | CPU | 278 ms | 237 ms | 85% |
+| 512 MiB / 100 chunks from 2 GB/s flash, 8 cores | link | 145 ms | 135 ms | 93% |
+
+In the first, 235 ms of decompression hides entirely inside 3.5 s of download. In the last, 237 ms of decompression across 8 cores hides inside 135 ms of reading. The single-core row is limited by decompression and the copy into the output array sharing one thread.
+
+`max_inflight_bytes` caps what a read holds — bytes still in flight plus bytes fetched but not yet decoded — so a fast link feeding a slow decoder cannot buffer the whole dataset.
+
 `ObjectStoreFile::stats()` reports what a read cost, and `ReadOptions` tunes the trade-off:
 
 ```rust

@@ -32,6 +32,8 @@ binrw = "0.15.2"
 bytemuck = "1.25"
 bytes = "1.11"
 futures-core = "0.3"
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 flate2 = { version = "1.1", features = ["zlib-rs"], default-features = false }
 object_store = "0.14"
 
@@ -47,9 +49,10 @@ hdf5 = { package = "hdf5-metno", version = "0.14", features = [
 chrono = { version = "0.4", features = ["wasmbind"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+async-trait = "0.1"
 ndarray = "0.17"
 tempfile = "3.27"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 async-trait = "0.1"

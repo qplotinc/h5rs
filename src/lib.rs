@@ -59,8 +59,21 @@
 //! [`ObjectStoreFile::stats`] reports what a read actually cost, and
 //! [`ReadOptions`] tunes the trade-off.
 //!
+//! # Overlapping I/O and decompression
+//!
+//! Reading compressed chunks is two kinds of work at once, and h5rs pipelines
+//! them: requests are kept in flight while each one that lands is decoded and
+//! copied into the output. Whichever resource is scarcer sets the pace and the
+//! other disappears behind it.
+//!
+//! Where the decompression runs is the caller's choice, because it depends
+//! entirely on the host — see [`compute`]. The default runs it on the async
+//! task, which still overlaps with I/O but uses one core; handing h5rs a
+//! [`ThreadPoolCompute`] or a pool of your own spreads it over many.
+//!
 //! [`ObjectStoreFile::stats`]: crate::object_store::ObjectStoreFile::stats
 //! [`ReadOptions`]: crate::object_store::ReadOptions
+//! [`ThreadPoolCompute`]: crate::compute::ThreadPoolCompute
 //!
 //! # Errors
 //!
@@ -115,6 +128,7 @@ use binrw::BinRead;
 
 use crate::object_store::ObjectStoreFile;
 
+pub mod compute;
 pub(crate) mod dataset;
 pub mod error;
 pub(crate) mod format;
@@ -2416,10 +2430,11 @@ mod test {
         println!("{:-<62}", "");
         for (name, workload) in workloads(&dense_path, &spread_path) {
             let mut row = String::new();
-            for max_batch_bytes in [1, 64 * 1024 * 1024] {
+            for (max_request_bytes, io_concurrency) in [(1, 1), (8 * 1024 * 1024, 16)] {
                 let options = ReadOptions {
                     metadata_block_size: 128 * KIB,
-                    max_batch_bytes,
+                    max_request_bytes,
+                    io_concurrency,
                     ..ReadOptions::default()
                 };
                 let file = workload.open(options);

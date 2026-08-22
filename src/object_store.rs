@@ -59,10 +59,25 @@ pub struct ReadOptions {
     /// Upper bound on the metadata block cache, in bytes. Once reached, the
     /// least recently used blocks are dropped.
     pub cache_capacity: u64,
-    /// Upper bound on the bytes one batched bulk fetch will hold in memory at
-    /// once. A read spanning more than this is split into several batches, and
-    /// no single merged request grows beyond it.
-    pub max_batch_bytes: u64,
+    /// How far adjacent chunks are merged into one request.
+    ///
+    /// A chunk larger than this still gets its own request; this only decides
+    /// when neighbours are worth combining. Bigger requests amortise latency,
+    /// but nothing in a request can be decoded until all of it has arrived, so
+    /// oversized ones starve the decoder at the start of a read.
+    pub max_request_bytes: u64,
+    /// How many bulk requests to keep in flight at once.
+    ///
+    /// This is what saturates a high-latency link: with a round trip of `t` and
+    /// a request that transfers in `d`, roughly `1 + t/d` requests are needed
+    /// to keep the pipe full.
+    pub io_concurrency: usize,
+    /// Ceiling on the bytes held by in-flight requests.
+    ///
+    /// Concurrency alone does not bound memory, because a single chunk can be
+    /// arbitrarily large. This does. One request is always allowed through, so
+    /// a chunk bigger than the ceiling is still readable.
+    pub max_inflight_bytes: u64,
     /// Two wanted ranges no further apart than this are fetched as one request,
     /// paying for the bytes in between to save a round trip.
     ///
@@ -77,7 +92,9 @@ impl Default for ReadOptions {
         ReadOptions {
             metadata_block_size: 512 * 1024,
             cache_capacity: 32 * 1024 * 1024,
-            max_batch_bytes: 64 * 1024 * 1024,
+            max_request_bytes: 512 * 1024,
+            io_concurrency: 16,
+            max_inflight_bytes: 32 * 1024 * 1024,
             coalesce_gap: 64 * 1024,
         }
     }
@@ -192,6 +209,7 @@ pub struct ObjectStoreFile {
     options: ReadOptions,
     cache: std::sync::Arc<Mutex<BlockCache>>,
     counters: std::sync::Arc<Counters>,
+    compute: std::sync::Arc<dyn crate::compute::ComputePool>,
     /// The object's size, learned from the first response. Zero until then.
     /// Read-ahead rounds requests up to a block boundary, which can run past
     /// the end of the file; knowing the size lets those be trimmed instead of
@@ -219,8 +237,24 @@ impl ObjectStoreFile {
             options,
             cache: Default::default(),
             counters: Default::default(),
+            compute: crate::compute::default_pool(),
             known_size: Default::default(),
         }
+    }
+
+    /// Use `pool` for the CPU-bound part of reads — decompressing and
+    /// un-shuffling chunks.
+    ///
+    /// Without this, decoding happens inline on the async task, which still
+    /// interleaves with I/O but uses one core. See [`crate::compute`].
+    pub fn with_compute(mut self, pool: std::sync::Arc<dyn crate::compute::ComputePool>) -> Self {
+        self.compute = pool;
+        self
+    }
+
+    /// The compute pool in force.
+    pub(crate) fn compute(&self) -> &std::sync::Arc<dyn crate::compute::ComputePool> {
+        &self.compute
     }
 
     /// The read-ahead and batching settings in force.
@@ -330,7 +364,7 @@ impl ObjectStoreFile {
         let merged = merge_ranges(
             ranges,
             self.options.coalesce_gap,
-            self.options.max_batch_bytes,
+            self.options.max_request_bytes,
         );
         let clamped: Vec<Option<Range<u64>>> =
             merged.iter().map(|r| self.clamp(r.clone())).collect();

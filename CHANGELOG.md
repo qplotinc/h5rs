@@ -39,6 +39,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ReadOptions` tunes read-ahead, cache size, batch size and coalescing.
 - A dataset remembers its chunk index, so repeated range reads on one dataset
   do not re-walk it.
+- Chunk reads are now a pipeline: requests stay in flight while each one that
+  lands is decompressed and copied into the output, so downloading and decoding
+  overlap instead of running in sequence. `object_store`'s `get_ranges` waits
+  for every range before returning, so bulk reads issue and consume their own
+  requests.
+- `compute::ComputePool` lets the host say where CPU-bound work runs.
+  `InlineCompute` (the default) runs it on the async task, which is right for
+  WASM; `ThreadPoolCompute` spreads it over OS threads without needing an async
+  runtime; anything else is a two-method trait.
+- `ReadOptions` gains `io_concurrency`, `max_request_bytes` and
+  `max_inflight_bytes`, which together decide how well a high-latency link is
+  saturated and how much memory a read holds.
 - A `dump` example that lists a file's datasets and reads one.
 
 ### Changed
@@ -55,6 +67,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a long run of attributes) no longer fails to parse.
 - Round-trip and fuzz tests now run against both on-disk formats and all three
   storage layouts.
+- Unfiltered chunks are copied straight out of the fetched bytes rather than
+  going through the compute pool.
 - Unsupported filter pipelines are rejected before any chunk is fetched, rather
   than being fed to the zlib decoder.
 

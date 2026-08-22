@@ -262,64 +262,26 @@ impl Dataset {
         Ok(())
     }
 
-    /// Undo the filter pipeline for one chunk.
-    ///
-    /// Filters are applied in order on write, so they are undone in reverse.
-    /// A chunk whose data a filter would have grown is stored with that filter
-    /// skipped and its bit set in the chunk's filter mask, so the mask has to be
-    /// honoured or such a chunk decodes to garbage.
-    ///
-    /// Returns `None` when no filter actually ran, letting the caller use the
-    /// fetched bytes without copying them.
-    fn decode_filters(
-        &self,
-        layout: &ChunkedLayout,
-        c: &ChunkRecord,
-        stored: &[u8],
-        uncompressed_bytes: usize,
-    ) -> H5Result<Option<Vec<u8>>> {
+    /// Whether any filter actually applies to this chunk, and so whether its
+    /// bytes have to pass through the compute pool at all.
+    fn needs_decode(&self, c: &ChunkRecord) -> bool {
         let Some(pipeline) = &self.filter else {
-            return Ok(None);
+            return false;
         };
-
-        let mut decoded: Option<Vec<u8>> = None;
-        for (i, fd) in pipeline.filters.iter().enumerate().rev() {
-            if c.filter_mask & (1u32 << i) != 0 {
-                continue;
-            }
-            let input: &[u8] = decoded.as_deref().unwrap_or(stored);
-            decoded = match fd.filter_type {
-                FilterType::None => continue,
-                FilterType::Deflate => {
-                    let mut out = Vec::with_capacity(uncompressed_bytes);
-                    let mut decoder = flate2::read::ZlibDecoder::new(input);
-                    decoder
-                        .read_to_end(&mut out)
-                        .map_err(|e| binrw::Error::Custom {
-                            pos: c.address,
-                            err: Box::new(e),
-                        })?;
-                    Some(out)
-                }
-                FilterType::Shuffle => Some(unshuffle(input, layout.element_size as usize)?),
-                // check_filters_supported rejects everything else up front.
-                ref other => {
-                    return Err(H5Error::unsupported(format!("{other:?} filter")));
-                }
-            };
-        }
-        Ok(decoded)
+        pipeline
+            .filters
+            .iter()
+            .enumerate()
+            .any(|(i, fd)| fd.filter_type != FilterType::None && c.filter_mask & (1u32 << i) == 0)
     }
 
-    /// Decode an already-fetched chunk and copy the specified sub-region
-    /// directly into `dst`. Unfiltered data is copied straight from the fetched
-    /// bytes with no intermediate buffer.
+    /// Copy an already-decoded chunk's sub-region into the output.
     #[allow(clippy::too_many_arguments)]
-    fn copy_chunk_into<T: H5Type>(
+    fn place_chunk<T: H5Type>(
         &self,
-        layout: &ChunkedLayout,
         c: &ChunkRecord,
-        stored: &[u8],
+        data: &[u8],
+        uncompressed_bytes: usize,
         chunk_shape: &[usize],
         src_start: &[usize],
         dst: &mut [T],
@@ -327,22 +289,6 @@ impl Dataset {
         dst_start: &[usize],
         size: &[usize],
     ) -> H5Result<()> {
-        let elem_size = std::mem::size_of::<T>();
-        let uncompressed_bytes = layout.chunk_bytes() as usize;
-
-        let decoded = if self.filter.is_none() {
-            if uncompressed_bytes != c.size as usize {
-                return Err(H5Error::corrupt(format!(
-                    "unfiltered chunk at {} records {} bytes but its layout implies {}",
-                    c.address, c.size, uncompressed_bytes
-                )));
-            }
-            None
-        } else {
-            self.decode_filters(layout, c, stored, uncompressed_bytes)?
-        };
-        let data: &[u8] = decoded.as_deref().unwrap_or(stored);
-
         if data.len() != uncompressed_bytes {
             return Err(H5Error::corrupt(format!(
                 "chunk at {} decoded to {} bytes, expected {}",
@@ -351,10 +297,9 @@ impl Dataset {
                 uncompressed_bytes
             )));
         }
-
         copy_region_inner(
             data,
-            elem_size,
+            std::mem::size_of::<T>(),
             &row_major_strides(chunk_shape),
             src_start,
             bytemuck::cast_slice_mut(dst),
@@ -516,40 +461,139 @@ impl Dataset {
             ));
         }
 
-        // Fetch in batches, so that a read spanning thousands of chunks still
-        // costs a handful of requests without holding the whole dataset twice.
-        let max_batch_bytes = file.options().max_batch_bytes.max(1);
-        let mut start = 0;
-        while start < wanted.len() {
-            let mut end = start;
-            let mut batch_bytes = 0u64;
-            while end < wanted.len()
-                && (end == start || batch_bytes + wanted[end].0.size <= max_batch_bytes)
-            {
-                batch_bytes += wanted[end].0.size;
-                end += 1;
+        self.stream_chunks_into(layout, &wanted, &chunk_dims, output, output_shape, file)
+            .await
+    }
+
+    /// Fetch and decode the wanted chunks as a pipeline.
+    ///
+    /// Requests are kept in flight up to `io_concurrency`; each one that lands
+    /// is handed straight to the compute pool, and each decoded chunk is copied
+    /// into the output as it comes back. So downloading, decompressing and
+    /// copying all proceed at once, and whichever is slowest sets the pace.
+    async fn stream_chunks_into<T: H5Type>(
+        &self,
+        layout: &ChunkedLayout,
+        wanted: &[(&ChunkRecord, ChunkCopy)],
+        chunk_dims: &[usize],
+        output: &mut [T],
+        output_shape: &[usize],
+        file: &ObjectStoreFile,
+    ) -> H5Result<()> {
+        use futures_util::stream::FuturesUnordered;
+
+        if wanted.is_empty() {
+            return Ok(());
+        }
+
+        let options = file.options();
+        let groups = group_requests(wanted, options.coalesce_gap, options.max_request_bytes);
+        let pool = file.compute().clone();
+        let uncompressed = layout.chunk_bytes() as usize;
+
+        let mut fetches = FuturesUnordered::new();
+        let mut decodes = FuturesUnordered::new();
+        let mut next_group = 0usize;
+        // Bytes h5rs is holding for this read: fetched-but-not-yet-copied, plus
+        // whatever is still in flight.
+        let mut held_bytes = 0u64;
+        // A pool with more workers than the concurrency setting would otherwise
+        // sit idle waiting for data.
+        let concurrency = options.io_concurrency.max(pool.parallelism()).max(1);
+
+        loop {
+            // Keep requests in flight up to the concurrency limit, but never let
+            // the bytes h5rs is holding run past the ceiling. That accounting
+            // spans both stages: a fast link feeding a slow decoder would
+            // otherwise buffer the whole dataset, since bytes that have arrived
+            // but not yet been decoded are just as resident as ones still in
+            // flight. One request is always allowed through, so an oversized
+            // chunk cannot deadlock the read.
+            while fetches.len() < concurrency && next_group < groups.len() {
+                let group = groups[next_group].clone();
+                let size = group.range.end - group.range.start;
+                let outstanding = !fetches.is_empty() || !decodes.is_empty();
+                if outstanding && held_bytes + size > options.max_inflight_bytes {
+                    break;
+                }
+                next_group += 1;
+                held_bytes += size;
+                let file = file.clone();
+                fetches.push(async move {
+                    let bytes = file.get_range(group.range.clone()).await?;
+                    H5Result::Ok((group, bytes))
+                });
             }
 
-            let ranges: Vec<Range<u64>> = wanted[start..end]
-                .iter()
-                .map(|(c, _)| c.address..c.address + c.size)
-                .collect();
-            let blobs = file.read_ranges(&ranges).await?;
-
-            for ((chunk, copy), stored) in wanted[start..end].iter().zip(&blobs) {
-                self.copy_chunk_into(
-                    layout,
-                    chunk,
-                    stored,
-                    &chunk_dims,
-                    &copy.src_start,
-                    output,
-                    output_shape,
-                    &copy.dst_start,
-                    &copy.size,
-                )?;
+            if fetches.is_empty() && decodes.is_empty() {
+                if next_group >= groups.len() {
+                    break;
+                }
+                // Backpressure emptied both queues; take the next request.
+                continue;
             }
-            start = end;
+
+            match next_event(&mut fetches, &mut decodes).await {
+                // A decoded chunk: copy it into the output and free the buffer.
+                Event::Decoded(result) => {
+                    let (index, decoded): (usize, Vec<u8>) = result?;
+                    let (chunk, copy) = &wanted[index];
+                    held_bytes = held_bytes.saturating_sub(chunk.size);
+                    self.place_chunk(
+                        chunk,
+                        &decoded,
+                        uncompressed,
+                        chunk_dims,
+                        &copy.src_start,
+                        output,
+                        output_shape,
+                        &copy.dst_start,
+                        &copy.size,
+                    )?;
+                }
+                // A fetched request: split it up and queue each chunk's decode.
+                Event::Fetched(result) => {
+                    let (group, bytes) = result?;
+                    // The group's bytes stay charged until each chunk cut from
+                    // them has been decoded and copied out.
+                    held_bytes = held_bytes
+                        .saturating_sub(group.range.end - group.range.start)
+                        .saturating_add(group.members.iter().map(|&i| wanted[i].0.size).sum());
+                    for &index in &group.members {
+                        let (chunk, copy) = &wanted[index];
+                        let start = (chunk.address - group.range.start) as usize;
+                        let end = (start + chunk.size as usize).min(bytes.len());
+                        let stored = bytes.slice(start.min(bytes.len())..end);
+
+                        // Nothing to undo: copy straight out of the fetched
+                        // bytes rather than paying for a job and a buffer.
+                        if !self.needs_decode(chunk) {
+                            held_bytes = held_bytes.saturating_sub(chunk.size);
+                            self.place_chunk(
+                                chunk,
+                                &stored,
+                                uncompressed,
+                                chunk_dims,
+                                &copy.src_start,
+                                output,
+                                output_shape,
+                                &copy.dst_start,
+                                &copy.size,
+                            )?;
+                            continue;
+                        }
+
+                        let filter = self.filter.clone();
+                        let element_size = layout.element_size as usize;
+                        let chunk = (*chunk).clone();
+                        let job: crate::compute::ComputeJob = Box::new(move || {
+                            decode_chunk(&filter, element_size, &chunk, &stored, uncompressed)
+                        });
+                        let run = pool.run(job);
+                        decodes.push(async move { run.await.map(|decoded| (index, decoded)) });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -702,4 +746,129 @@ fn unshuffle(data: &[u8], element_size: usize) -> H5Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// A single bulk request, and which of the wanted chunks it carries.
+#[derive(Clone, Debug)]
+struct RequestGroup {
+    range: Range<u64>,
+    members: Vec<usize>,
+}
+
+/// Group the wanted chunks into requests.
+///
+/// Chunks that sit next to each other on disk are fetched together, since the
+/// gap between them costs less than another round trip — but only up to
+/// `max_bytes`, because nothing in a request can be decoded until all of it has
+/// landed.
+fn group_requests(
+    wanted: &[(&ChunkRecord, ChunkCopy)],
+    gap: u64,
+    max_bytes: u64,
+) -> Vec<RequestGroup> {
+    let mut order: Vec<usize> = (0..wanted.len()).collect();
+    order.sort_unstable_by_key(|&i| wanted[i].0.address);
+
+    let max_bytes = max_bytes.max(1);
+    let mut groups: Vec<RequestGroup> = vec![];
+    for index in order {
+        let chunk = wanted[index].0;
+        let range = chunk.address..chunk.address + chunk.size;
+        match groups.last_mut() {
+            Some(last)
+                if range.start <= last.range.end.saturating_add(gap)
+                    && range.end.saturating_sub(last.range.start) <= max_bytes =>
+            {
+                last.range.end = last.range.end.max(range.end);
+                last.members.push(index);
+            }
+            _ => groups.push(RequestGroup {
+                range,
+                members: vec![index],
+            }),
+        }
+    }
+    groups
+}
+
+/// Undo the filter pipeline for one chunk.
+///
+/// Filters are applied in order on write, so they are undone in reverse. A
+/// chunk whose data a filter would have grown is stored with that filter
+/// skipped and its bit set in the chunk's filter mask, so the mask has to be
+/// honoured or such a chunk decodes to garbage.
+///
+/// This runs on the compute pool, so it takes only owned values.
+fn decode_chunk(
+    filter: &Option<FilterMessage>,
+    element_size: usize,
+    c: &ChunkRecord,
+    stored: &[u8],
+    uncompressed_bytes: usize,
+) -> H5Result<Vec<u8>> {
+    let Some(pipeline) = filter else {
+        return Ok(stored.to_vec());
+    };
+
+    let mut decoded: Option<Vec<u8>> = None;
+    for (i, fd) in pipeline.filters.iter().enumerate().rev() {
+        if c.filter_mask & (1u32 << i) != 0 {
+            continue;
+        }
+        let input: &[u8] = decoded.as_deref().unwrap_or(stored);
+        decoded = match fd.filter_type {
+            FilterType::None => continue,
+            FilterType::Deflate => {
+                let mut out = Vec::with_capacity(uncompressed_bytes);
+                let mut decoder = flate2::read::ZlibDecoder::new(input);
+                out.reserve(uncompressed_bytes);
+                decoder
+                    .read_to_end(&mut out)
+                    .map_err(|e| binrw::Error::Custom {
+                        pos: c.address,
+                        err: Box::new(e),
+                    })?;
+                Some(out)
+            }
+            FilterType::Shuffle => Some(unshuffle(input, element_size)?),
+            // check_filters_supported rejects everything else up front.
+            ref other => {
+                return Err(H5Error::unsupported(format!("{other:?} filter")));
+            }
+        };
+    }
+    Ok(decoded.unwrap_or_else(|| stored.to_vec()))
+}
+
+/// Which pipeline stage finished first.
+enum Event<F, D> {
+    Fetched(F),
+    Decoded(D),
+}
+
+/// Wait for the next fetch or decode to complete.
+///
+/// Decodes are checked first so that finished buffers are copied out and freed
+/// before more are pulled in, which is what bounds the memory a read holds.
+async fn next_event<F, D>(
+    fetches: &mut futures_util::stream::FuturesUnordered<F>,
+    decodes: &mut futures_util::stream::FuturesUnordered<D>,
+) -> Event<F::Output, D::Output>
+where
+    F: std::future::Future,
+    D: std::future::Future,
+{
+    use futures_util::StreamExt;
+    use std::task::Poll;
+
+    futures_util::future::poll_fn(|cx| {
+        if let Poll::Ready(Some(decoded)) = decodes.poll_next_unpin(cx) {
+            return Poll::Ready(Event::Decoded(decoded));
+        }
+        if let Poll::Ready(Some(fetched)) = fetches.poll_next_unpin(cx) {
+            return Poll::Ready(Event::Fetched(fetched));
+        }
+        Poll::Pending
+    })
+    .await
 }
