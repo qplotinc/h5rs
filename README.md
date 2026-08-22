@@ -104,7 +104,9 @@ Measured against a simulated link (`cargo test --features hdf5-compare --test pi
 
 In the first, 235 ms of decompression hides entirely inside 3.5 s of download. In the last, 237 ms of decompression across 8 cores hides inside 135 ms of reading. The single-core row is limited by decompression and the copy into the output array sharing one thread.
 
-`max_inflight_bytes` caps what a read holds — bytes still in flight plus bytes fetched but not yet decoded — so a fast link feeding a slow decoder cannot buffer the whole dataset.
+`max_inflight_bytes` caps what a read holds — bytes still in flight plus bytes fetched but not yet decoded — so a fast link feeding a slow decoder cannot buffer the whole dataset. It never drops below two requests in flight, so a dataset whose chunks each exceed the ceiling still pipelines.
+
+On native under Tokio, `LocalFileSystem` dispatches every read to the blocking pool, so these are real concurrent `pread`s — the queue depth an SSD needs to reach its rated throughput. With large chunks it is `max_inflight_bytes`, not `io_concurrency`, that decides how deep the queue goes: 2.6 MiB chunks under the default 32 MiB ceiling reach 12 concurrent reads. Raise it if reads are shallow; `cargo test --features hdf5-compare --test pipeline native_request_concurrency -- --ignored --nocapture` reports peak and mean depth.
 
 `ObjectStoreFile::stats()` reports what a read cost, and `ReadOptions` tunes the trade-off:
 

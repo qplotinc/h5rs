@@ -127,6 +127,12 @@ struct Report {
     bytes: u64,
     requests: usize,
     decodes: usize,
+    /// The most requests that were ever outstanding at the same moment. This is
+    /// what an SSD sees as queue depth, and what decides whether it can keep its
+    /// channels busy.
+    peak_concurrency: usize,
+    /// Average number outstanding over the time any were.
+    mean_concurrency: f64,
 }
 
 impl Report {
@@ -167,8 +173,9 @@ impl Display for Report {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:<28} wall {:>7.0}ms  link {:>7.0}ms ({:>3.0}%)  decode {:>7.0}ms/{} ({:>3.0}%)  \
-             ideal {:>7.0}ms  eff {:>3.0}%  overlap {:>3.0}%  [{} reqs, {} chunks, {:.0} MiB]",
+            "{:<40} wall {:>7.0}ms  link {:>7.0}ms ({:>3.0}%)  decode {:>7.0}ms/{} ({:>3.0}%)  \
+             ideal {:>7.0}ms  eff {:>3.0}%  overlap {:>3.0}%  concurrency {:>2}/{:.1}  \
+             [{} reqs, {} chunks, {:.0} MiB]",
             self.label,
             self.wall.as_secs_f64() * 1e3,
             self.link_busy.as_secs_f64() * 1e3,
@@ -179,6 +186,8 @@ impl Display for Report {
             self.ideal().as_secs_f64() * 1e3,
             self.efficiency() * 100.0,
             self.overlapped() * 100.0,
+            self.peak_concurrency,
+            self.mean_concurrency,
             self.requests,
             self.decodes,
             self.bytes as f64 / (1024.0 * 1024.0),
@@ -217,6 +226,40 @@ fn union(mut intervals: Vec<(Duration, Duration)>) -> Duration {
 
 fn total(intervals: &[(Duration, Duration)]) -> Duration {
     intervals.iter().map(|(s, e)| *e - *s).sum()
+}
+
+/// How deeply a set of intervals overlaps: the most that were ever open at
+/// once, and the average over the time any were open.
+fn concurrency(intervals: &[(Duration, Duration)]) -> (usize, f64) {
+    let mut events: Vec<(Duration, i32)> = Vec::with_capacity(intervals.len() * 2);
+    for (start, end) in intervals {
+        events.push((*start, 1));
+        events.push((*end, -1));
+    }
+    // Close before open at the same instant, so touching intervals do not read
+    // as overlapping.
+    events.sort_unstable_by_key(|(at, delta)| (*at, -*delta));
+
+    let (mut open, mut peak) = (0i32, 0i32);
+    let mut weighted = Duration::ZERO.as_secs_f64();
+    let mut span = 0.0f64;
+    let mut previous: Option<Duration> = None;
+    for (at, delta) in events {
+        if let Some(prev) = previous {
+            if open > 0 {
+                let dt = (at - prev).as_secs_f64();
+                weighted += dt * open as f64;
+                span += dt;
+            }
+        }
+        open += delta;
+        peak = peak.max(open);
+        previous = Some(at);
+    }
+    (
+        peak as usize,
+        if span > 0.0 { weighted / span } else { 0.0 },
+    )
 }
 
 /// Total length of the overlap between two sets of intervals.
@@ -484,6 +527,8 @@ async fn measure(scenario: Scenario<'_>) -> Report {
         bytes: trace.bytes,
         requests: trace.requests.len(),
         decodes: trace.decodes.len(),
+        peak_concurrency: concurrency(&trace.requests).0,
+        mean_concurrency: concurrency(&trace.requests).1,
     }
 }
 
@@ -553,6 +598,53 @@ async fn web_object_storage() {
         })
         .await;
         println!("{report}");
+    }
+}
+
+/// Native, on a real filesystem with stock Tokio: how many reads are actually
+/// outstanding at once.
+///
+/// A modern SSD needs several requests in flight to reach its rated
+/// throughput — one at a time leaves most of its parallelism unused. Under
+/// Tokio, `LocalFileSystem` dispatches each read to the blocking pool, so the
+/// depth h5rs reaches is decided by how many requests its pipeline keeps open,
+/// not by the filesystem.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn native_request_concurrency() {
+    let fixture = Fixture::build(134_217_728, 1_342_178);
+    println!(
+        "\nnative: 512 MiB in 100 chunks ({:.0} MiB stored), real filesystem, stock Tokio\n",
+        fixture.stored_bytes() as f64 / (1024.0 * 1024.0)
+    );
+
+    // Chunks here store about 2.6 MiB each, so with the default 32 MiB ceiling
+    // it is the memory bound — not `io_concurrency` — that decides how deep the
+    // queue gets.
+    for max_inflight_bytes in [2u64 << 20, 8 << 20, 32 << 20] {
+        for (label, compute) in [
+            (
+                "inline (1 core)",
+                Arc::new(InlineCompute) as Arc<dyn ComputePool>,
+            ),
+            ("thread pool (8 cores)", Arc::new(ThreadPoolCompute::new(8))),
+        ] {
+            let report = measure(Scenario {
+                label: format!("{label}, {} MiB held", max_inflight_bytes >> 20),
+                fixture: &fixture,
+                latency: Duration::ZERO,
+                // No simulated link: this is the real SSD, so `link` is zero
+                // and only the concurrency columns mean anything.
+                bytes_per_sec: None,
+                compute,
+                options: ReadOptions {
+                    max_inflight_bytes,
+                    ..ReadOptions::default()
+                },
+            })
+            .await;
+            println!("{report}");
+        }
     }
 }
 
@@ -706,6 +798,63 @@ async fn yields_to_the_host_while_decoding() {
     // The data still has to be right: yielding must not reorder or drop chunks.
     let expected = sample_data(values.data.len());
     assert_eq!(values.data, expected);
+}
+
+/// A dataset whose chunks are each larger than the memory ceiling still
+/// pipelines.
+///
+/// The ceiling bounds what a read holds, but taken literally it would allow
+/// only one request at a time here — nothing downloading while a chunk decodes,
+/// nothing decoding while one downloads. A floor of two requests keeps the
+/// pipeline alive at the cost of holding about two chunks.
+#[tokio::test(flavor = "multi_thread")]
+async fn pipelines_when_a_chunk_exceeds_the_memory_ceiling() {
+    let fixture = Fixture::build(4 * 1024 * 1024, 1024 * 1024);
+    let path = fixture.path.canonicalize().unwrap();
+
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let origin = Instant::now();
+    let store = LinkStore::new(
+        path.parent().unwrap(),
+        Duration::from_millis(1),
+        Some(200.0e6),
+        trace.clone(),
+        origin,
+    );
+    let pool = Arc::new(TracingCompute {
+        inner: Arc::new(InlineCompute),
+        origin,
+        trace: trace.clone(),
+    });
+    let file = ObjectStoreFile::with_options(
+        Box::new(store),
+        Path::from(path.file_name().unwrap().to_str().unwrap()),
+        ReadOptions {
+            // Well under the ~2 MiB each chunk stores.
+            max_inflight_bytes: 64 * 1024,
+            ..ReadOptions::default()
+        },
+    )
+    .with_compute(pool);
+
+    let ds = h5rs::open_dataset(&file, &["data"]).await.unwrap().unwrap();
+    let values = ds.read_full::<u32>(&file).await.unwrap();
+    assert_eq!(values.data, sample_data(fixture.values));
+
+    let trace = trace.lock().unwrap();
+    let (peak, _) = concurrency(&trace.requests);
+    assert!(
+        peak >= 2,
+        "a ceiling below one chunk collapsed the pipeline to {peak} request(s) in flight"
+    );
+
+    let overlapped = intersection(&trace.decodes, &trace.requests);
+    let fraction = ratio(overlapped, union(trace.decodes.clone()));
+    assert!(
+        fraction > 0.5,
+        "only {:.0}% of decoding overlapped a request",
+        fraction * 100.0
+    );
 }
 
 /// The property those measurements are about: decoding overlaps downloading.

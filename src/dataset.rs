@@ -90,6 +90,10 @@ fn copy_region_inner(
     }
 }
 
+/// Requests h5rs will keep in flight regardless of the memory ceiling, so that
+/// there is always something downloading while something else decodes.
+const MIN_IN_FLIGHT: usize = 2;
+
 /// Where one chunk's contribution to the output lives, in elements.
 struct ChunkCopy {
     /// Offset of the intersection within the chunk.
@@ -507,13 +511,18 @@ impl Dataset {
             // spans both stages: a fast link feeding a slow decoder would
             // otherwise buffer the whole dataset, since bytes that have arrived
             // but not yet been decoded are just as resident as ones still in
-            // flight. One request is always allowed through, so an oversized
-            // chunk cannot deadlock the read.
+            // flight.
+            //
+            // `MIN_IN_FLIGHT` requests are always allowed through, whatever the
+            // ceiling says. A dataset whose chunks are each larger than the
+            // ceiling would otherwise be read one chunk at a time, with nothing
+            // downloading while a chunk decodes and nothing decoding while one
+            // downloads — no pipeline at all.
             while fetches.len() < concurrency && next_group < groups.len() {
                 let group = groups[next_group].clone();
                 let size = group.range.end - group.range.start;
-                let outstanding = !fetches.is_empty() || !decodes.is_empty();
-                if outstanding && held_bytes + size > options.max_inflight_bytes {
+                if fetches.len() >= MIN_IN_FLIGHT && held_bytes + size > options.max_inflight_bytes
+                {
                     break;
                 }
                 next_group += 1;

@@ -77,11 +77,19 @@ pub struct ReadOptions {
     /// a request that transfers in `d`, roughly `1 + t/d` requests are needed
     /// to keep the pipe full.
     pub io_concurrency: usize,
-    /// Ceiling on the bytes held by in-flight requests.
+    /// Ceiling on the bytes a read holds: requests in flight, plus data that
+    /// has arrived but not yet been decoded and copied out.
     ///
     /// Concurrency alone does not bound memory, because a single chunk can be
-    /// arbitrarily large. This does. One request is always allowed through, so
-    /// a chunk bigger than the ceiling is still readable.
+    /// arbitrarily large. This does — but only down to a floor of two requests,
+    /// which are always allowed through so that there is something downloading
+    /// while something else decodes. Reading a dataset whose chunks are each
+    /// larger than this therefore holds about two chunks, not this many bytes.
+    ///
+    /// With large chunks this, rather than
+    /// [`io_concurrency`](Self::io_concurrency), is usually what decides how
+    /// many requests are outstanding — and a modern SSD needs several to reach
+    /// its rated throughput. Raise it if reads are shallow.
     pub max_inflight_bytes: u64,
     /// Two wanted ranges no further apart than this are fetched as one request,
     /// paying for the bytes in between to save a round trip. Bounded by

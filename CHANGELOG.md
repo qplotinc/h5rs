@@ -60,7 +60,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `max_inflight_bytes`, which together decide how well a high-latency link is
   saturated and how much memory a read holds. `max_coalesced_bytes` is a
   ceiling on merging neighbouring ranges, not on request size: a chunk is
-  always fetched whole, however large.
+  always fetched whole, however large. `max_inflight_bytes` never cuts below
+  two requests in flight, so a dataset whose chunks each exceed it still
+  pipelines rather than falling back to reading one chunk at a time.
 - A `dump` example that lists a file's datasets and reads one.
 
 ### Changed
