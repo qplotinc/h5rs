@@ -8,6 +8,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Object, attribute and string access for format readers such as AnnData and
+  CellRanger: `open_object` (an object's kind, decoded attributes and
+  children), `read_vl_strings` (variable-length strings from the global heap),
+  `fixed_strings`, and `Dataset::string_kind` / `Dataset::read_strings`.
+- Enumeration datatypes (class 8, h5py's booleans) read as their unsigned base
+  integer; `Dataset::is_enumeration`.
+- `Dataset::element_size`, `Dataset::attributes`, and
+  `Dataset::read_range_bytes` — a rectangular region as raw element bytes, for
+  datatypes with no `H5Type`.
 - Read files written in HDF5's "latest" on-disk format (`H5Pset_libver_bounds`),
   as emitted by HDF5 1.10 and later:
   - superblock versions 2 and 3;

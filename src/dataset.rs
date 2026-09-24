@@ -214,13 +214,131 @@ impl Dataset {
     }
 
     /// Returns (is_float, is_signed, byte_size) for the dataset's scalar type.
+    /// An enumeration reads as its unsigned base integer.
     pub fn dtype_info(&self) -> (bool, bool, usize) {
         use crate::format::object::TypeDescriptor;
         match &self.datatype.type_desc {
             TypeDescriptor::FloatingPoint(fp) => (true, true, fp.size() as usize),
             TypeDescriptor::FixedPoint(fp) => (false, fp.signed() != 0, fp.size() as usize),
+            TypeDescriptor::Enumeration(e) => (false, false, e.size() as usize),
             _ => (false, false, 0),
         }
+    }
+
+    /// The datatype's on-disk element size.
+    pub fn element_size(&self) -> H5Result<usize> {
+        self.datatype.element_size()
+    }
+
+    /// Whether the datatype is an enumeration (h5py's
+    /// booleans), so a reader can tell a flag column from a `uint8`.
+    pub fn is_enumeration(&self) -> bool {
+        use crate::format::object::TypeDescriptor;
+        matches!(self.datatype.type_desc, TypeDescriptor::Enumeration(_))
+    }
+
+    /// This object's attributes.
+    pub fn attributes(&self) -> &[crate::format::object::AttributeMessage] {
+        &self.attributes
+    }
+
+    /// A rectangular sub-region as raw element bytes —
+    /// `element_size()` bytes per element, row-major — for datatypes with no
+    /// `H5Type` (fixed-length strings, variable-length references, enums).
+    /// Returns the bytes and the region's shape in elements.
+    ///
+    /// Implemented as a *byte view*: the same storage re-described with a
+    /// one-byte datatype and its innermost dimension (and chunk dimension,
+    /// and chunk offsets) multiplied by the element size, then read through
+    /// the ordinary typed path as `u8`. A scalar dataset views as one row of
+    /// `element_size` bytes. The shuffle filter needs the true element size,
+    /// so a shuffled dataset is refused here rather than un-shuffled wrongly.
+    pub async fn read_range_bytes(
+        &self,
+        selection: &[Range<u64>],
+        file: &ObjectStoreFile,
+    ) -> H5Result<(Vec<u8>, Vec<usize>)> {
+        let elem = self.element_size()?;
+        let ndim = self.ndim();
+        if selection.len() != ndim {
+            return Err(H5Error::InvalidSelection(format!(
+                "selection has {} range(s) but the dataset has {ndim} dimension(s)",
+                selection.len()
+            )));
+        }
+        if let Some(fm) = &self.filter
+            && fm
+                .filters
+                .iter()
+                .any(|fd| fd.filter_type == FilterType::Shuffle)
+        {
+            return Err(H5Error::unsupported(
+                "raw reads of a shuffled dataset (the byte view cannot un-shuffle)",
+            ));
+        }
+        let elem64 = elem as u64;
+
+        // The view's dataspace: innermost dimension in bytes; a scalar
+        // becomes one dimension of `elem` bytes.
+        let mut dataspace = self.dataspace.clone();
+        let mut sel: Vec<Range<u64>> = selection.to_vec();
+        if ndim == 0 {
+            dataspace.dimensionality = 1;
+            dataspace.dataspace_type = 1;
+            dataspace.dimension = vec![elem64];
+            dataspace.dimension_max = vec![elem64];
+            sel = std::iter::once(0..elem64).collect();
+        } else {
+            let last = ndim - 1;
+            dataspace.dimension[last] *= elem64;
+            if dataspace.dimension_max.len() > last && dataspace.dimension_max[last] != u64::MAX {
+                dataspace.dimension_max[last] *= elem64;
+            }
+            sel[last] = sel[last].start * elem64..sel[last].end * elem64;
+        }
+
+        // The view's layout: chunk dims in bytes, element size 1. Chunk
+        // records are re-derived with byte offsets so the read never walks
+        // the index in the wrong units.
+        let mut layout = self.layout.clone();
+        let mut chunks_in_bytes = None;
+        if let LayoutInner::Chunked(c) = &mut layout.inner {
+            let last = c.chunk_dims.len().saturating_sub(1);
+            if ndim > 0 {
+                c.chunk_dims[last] *= elem64;
+            }
+            c.element_size = 1;
+            let records = self.collect_chunks(file).await?;
+            let scaled: Vec<ChunkRecord> = records
+                .iter()
+                .map(|r| {
+                    let mut r = r.clone();
+                    if let Some(o) = r.offsets.last_mut() {
+                        *o *= elem64;
+                    }
+                    r
+                })
+                .collect();
+            chunks_in_bytes = Some(std::sync::Arc::new(scaled));
+        }
+
+        let view = Dataset {
+            chunks: std::sync::Mutex::new(chunks_in_bytes),
+            name: self.name.clone(),
+            dataspace,
+            datatype: DatatypeMessage::unsigned_byte(),
+            layout,
+            filter: self.filter.clone(),
+            attributes: Vec::new(),
+        };
+        let arr = view.read_range::<u8>(&sel, file).await?;
+        let mut shape = arr.shape;
+        if ndim == 0 {
+            shape = vec![];
+        } else if let Some(last) = shape.last_mut() {
+            *last /= elem;
+        }
+        Ok((arr.data, shape))
     }
 
     /// The chunked layout, or an error naming the layout this dataset actually

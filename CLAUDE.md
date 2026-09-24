@@ -54,6 +54,7 @@ The official HDF5 file format spec is available at: https://support.hdfgroup.org
 - **`src/format/chunk_index.rs`** — Enumerates a chunked dataset's chunks through any of the six index structures into a common `ChunkRecord`. Element widths are taken from the sizes recorded in each index header rather than recomputed.
 - **`src/format/dense.rs`** — Links and attributes stored densely (fractal heap + v2 B-tree).
 - **`src/dataset.rs`** — `Dataset`: the public reader. Dispatches `read_full`/`read_range` across the chunked, contiguous and compact layouts, decodes the filter pipeline, and assembles sub-regions with `copy_region_inner`.
+- **`src/access.rs`** — Object/attribute/string access for format readers: `open_object` (kind, decoded attributes, children), the global heap (`read_vl_strings`), and `Dataset::read_strings`, built on `Dataset::read_range_bytes` — a raw byte view that re-describes the dataset with a one-byte datatype.
 - **`src/object_store.rs`** — `ObjectStoreFile` (ranged GETs against an `ObjectStore`) plus the crate-private binrw fetch-and-parse helpers.
 - **`src/node_store.rs` / `src/node_fs.js`** — Node.js filesystem `ObjectStore` used only by the wasm32 test build.
 
