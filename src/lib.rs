@@ -131,6 +131,7 @@ use binrw::BinRead;
 
 use crate::object_store::ObjectStoreFile;
 
+pub mod access;
 pub mod compute;
 pub(crate) mod dataset;
 pub mod error;
@@ -140,6 +141,10 @@ pub mod h5type;
 mod node_store;
 pub mod object_store;
 
+pub use access::{
+    AttrValue, Attribute, Child, ObjectInfo, ObjectKind, StringKind, fixed_strings, open_object,
+    read_vl_strings,
+};
 pub use dataset::{Dataset, NdArray};
 
 /// Metadata about a dataset found during HDF5 tree walking.

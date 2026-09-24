@@ -848,8 +848,38 @@ pub enum TypeDescriptor {
     String(StringDescriptor),
     #[br(pre_assert(class == 9))]
     Variable(VariableLengthDescriptor),
-    #[br(pre_assert(class > 1 && class != 3 && class != 9))]
+    /// An enumeration (class 8) — what h5py writes for
+    /// a boolean. Only the size is read; the member names and values that
+    /// follow are left unparsed (the message is size-delimited).
+    #[br(pre_assert(class == 8))]
+    Enumeration(EnumerationDescriptor),
+    #[br(pre_assert(class > 1 && class != 3 && class != 8 && class != 9))]
     UnimplementedTypeClass,
+}
+
+/// Class bit fields (3 bytes) + size (u32).
+#[derive(BinRead, Debug, Clone)]
+pub struct EnumerationDescriptor([u8; 7]);
+
+impl EnumerationDescriptor {
+    pub fn size(&self) -> u32 {
+        u32::from_le_bytes([self.0[3], self.0[4], self.0[5], self.0[6]])
+    }
+}
+
+impl DatatypeMessage {
+    /// The datatype of one unsigned byte — what a raw
+    /// byte view of a dataset reads as (`Dataset::read_range_bytes`).
+    pub(crate) fn unsigned_byte() -> DatatypeMessage {
+        DatatypeMessage {
+            // version 1, class 0 (fixed-point)
+            version_and_class: VersionAndClass(0x10),
+            // class bits (unsigned), size 1, bit offset 0, precision 8
+            type_desc: TypeDescriptor::FixedPoint(FixedPointDescriptor([
+                0, 0, 0, 1, 0, 0, 0, 0, 0, 8, 0,
+            ])),
+        }
+    }
 }
 
 #[derive(BinRead, Debug, Clone)]
@@ -881,6 +911,7 @@ impl DatatypeMessage {
             TypeDescriptor::FixedPoint(fp) => fp.size() as usize,
             TypeDescriptor::FloatingPoint(fp) => fp.size() as usize,
             TypeDescriptor::String(s) => s.size() as usize,
+            TypeDescriptor::Enumeration(e) => e.size() as usize,
             // VL references on disk: uint32 length + uint64 heap addr + uint32 heap index = 16
             TypeDescriptor::Variable(_) => 16,
             TypeDescriptor::UnimplementedTypeClass => {

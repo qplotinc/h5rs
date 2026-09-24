@@ -30,6 +30,7 @@ fn describe(desc: &TypeDescriptor) -> String {
         TypeDescriptor::FloatingPoint(fp) => format!("a {}-byte float", fp.size()),
         TypeDescriptor::String(s) => format!("a {}-byte string", s.size()),
         TypeDescriptor::Variable(_) => "a variable-length type".to_string(),
+        TypeDescriptor::Enumeration(e) => format!("a {}-byte enumeration", e.size()),
         TypeDescriptor::UnimplementedTypeClass => "an unsupported type class".to_string(),
     }
 }
